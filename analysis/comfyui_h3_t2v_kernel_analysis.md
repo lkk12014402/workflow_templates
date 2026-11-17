@@ -5,6 +5,8 @@
 > 目的：回答“每个模型怎样加载、怎样推理、经过哪些函数和 op、数学逻辑是什么”，并明确哪些底层 CUDA kernel 尚未通过动态 trace 证实。
 >
 > 本文不是 vLLM-Omni 路线，不讨论其他 H3 workflow，也不重新估算整套显存。显存只在与权重加载、offload、prefetch 和 tensor 生命周期直接相关处展开。
+>
+> **阅读导航**：第 1–16 章是源码与既有运行证据分析；第 17 章是后续补充的真实 CUPTI/NVTX 实测。前文中“未 trace”“候选路径”的表述反映当时证据边界，具体 kernel 类型和实测数量以第 17 章及 [CUPTI 逐 Kernel 实测报告](./cupti_h3_t2v_kernel_report.md) 为准。
 
 ## 0. 先给出结论
 
@@ -14,7 +16,7 @@
 4. **主 DiT 的大 GEMM 是 INT8 ConvRot 路径，但不是整个模型都 INT8。** 只有 50 个主 block 中的 `qkv_proj`、`out_proj`、`fc1`、`fc2` 共 200 个 Linear 带 INT8 + ConvRot 元数据。AdaLN、patch projection、token refiner、final head 等必须分开看。
 5. **Qwen 的 NVFP4 是存储格式，不等于本流程做 FP4 GEMM。** 全部 350 个 NVFP4 Linear 都设置 `full_precision_matrix_mult=true`，文本 encode 又默认 `full_precision_mm=True`。因此默认是反量化后普通全精度 `F.linear`，不是 `scaled_mm_nvfp4`。
 6. **视频 VAE 的 3D CNN encoder 在本 T2V 中完全不执行。** 实际 decode 是 `post_quant_conv` 加 36 层 ViT3D decoder，并且内部同时做空间 tile、时间 chunk。音频 VAE 也只跑 BigVGAN decoder，不跑 encoder 的 CausalAttention。
-7. **日志中的 `Using pytorch attention` 是 Python dispatcher 的选择，不是最底层 kernel 名。** H3 主 attention 经 `attention_pytorch` 到 PyTorch SDPA；SDPA 最终是 Flash、cuDNN 还是 mem-efficient 后端，必须有 profiler/CUPTI 才能断言。
+7. **日志中的 `Using pytorch attention` 是 Python dispatcher 的选择，不是最底层 kernel 名。** H3 主 attention 经 `attention_pytorch` 到 PyTorch SDPA；第 17 章的 CUPTI 实测进一步确认主 DiT 使用 BF16 FlashAttention，Qwen 使用 FP32 mem-efficient attention。
 8. **本报告不伪造 kernel trace。** 下文会给出静态可确定的 PyTorch op、Comfy Kitchen custom op 和 C++ binding，以及各回退条件；不把 backend “注册可用列表”冒充实际执行列表。
 
 ## 1. 分析基线与证据等级
@@ -49,15 +51,18 @@
 | 视频 VAE | `models/vae/minimax_h3_video_vae_int8_convrot.safetensors` | 2,811,065,184 | 视频 latent → RGB frames |
 | 音频 VAE | `models/vae/minimax_h3_audio_vae_fp32.safetensors` | 605,254,808 | 音频 latent → 32 kHz 双声道波形 |
 
-### 1.2 三类证据标记
+**后续 CUPTI 复测基线**：使用相同 API prompt，在独立 8189 实例得到 prompt ID `24fe3352-d0a1-4dd7-ac4a-4b1b46b1f09f`，原始文件为 `logs/cupti_h3_t2v/h3_t2v_cold.nsys-rep` 和 `h3_t2v_cold.sqlite`。它包含模型首次执行，但不包含 ComfyUI 启动初始化。独立输出 `logs/cupti_h3_t2v/output/video/MiniMax_H3_00001_.mp4` 也已验证成功。
+
+### 1.2 证据等级与标记
 
 本文使用以下措辞严格区分证据强度：
 
 - **[实测]**：来自实际 API prompt、执行事件、日志、内存采样、媒体检查或 checkpoint 元数据。
 - **[静态路径]**：由固定版本源码可确定的调用关系。若不存在运行时 shape/backend 限制，它就是对本流程的高可信解释。
 - **[候选/回退]**：依赖运行时 dtype、shape、设备能力、环境变量、tensor 对齐、异常或 backend 注册的路径。没有动态 trace 时不把候选写成已执行。
+- **[CUPTI 实测]**：来自本次 Nsight Systems/CUPTI 原始 SQLite 的真实 kernel 名称、次数、时间、grid/block、寄存器、shared memory、stream 和 `graphNodeId`。NVTX 只负责阶段标记，kernel 与阶段的归属由 runtime correlationId 决定，不由作者猜测。
 
-实际没有采集 CUPTI、Nsight Systems、`torch.profiler` kernel 表或 CUDA Graph launch trace。所以：
+第 1–16 章撰写时没有采集 CUPTI、Nsight Systems、`torch.profiler` kernel 表或 CUDA Graph launch trace，所以当时采用以下边界；第 17 章已经按后续要求补齐真实 CUPTI/NVTX 采集：
 
 - 可以严谨列出 `F.linear`、`scaled_dot_product_attention`、`ck.int8_linear`、`ck.rms_rope_split_half_` 等调用；
 - 可以列出 `_C.cutlass_int8_dequant`、`_C.cublas_gemm_blockwise_fp4` 等源码 binding 的选择条件；
@@ -130,6 +135,44 @@ API 提交展开后的 prompt graph
           ├─ CreateVideo → VideoFromComponents
           └─ SaveVideo → VideoFromComponents.save_to → PyAV/FFmpeg MP4
 ```
+
+**端到端函数链与真实 kernel 的对应**
+
+下图是把上面的 Python 调用栈落到本次 CUPTI 结果后的简化视图。数字均为本次实际调用次数，不是 backend capability 列表：
+
+```text
+Qwen3-VL 前 50 层（一次）
+  → 350 × dequantize_nvfp4_kernel
+  → 350 × FP32 cutlass3x_sm100_simt_sgemm
+  → 50 × fmha_cutlassF_f32_aligned_64x128_rf_sm80
+  → condition_proj + TokenRefiner（一次）
+       └─ 2 × BF16 flash_fwd_kernel（文本短序列）
+
+20 次 MiniMaxH3Model.forward
+  → 每次 50 × DiTBlock
+       ├─ INT8 QKV/out/fc1/fc2（全任务 4000 次）
+       ├─ ConvRot 在线量化（全任务 4000 次）
+       ├─ BF16 flash_fwd_kernel（全任务 1000 次）
+       ├─ fused RMSNorm + RoPE（全任务 1000 次）
+       └─ modality scale/shift/gate + addcmul（全任务 6000 次）
+  → video/audio velocity → res_multistep（普通 ATen 小 op）
+
+Video VAE：37 latent → 124 frames
+  → 7 temporal chunks × 3 height tiles × (4+1) width batches
+  → 42 × ViT3DDecoder.forward
+       ├─ 36 × 4 INT8 Linear（全任务 6048 次）
+       ├─ 36 × qk_int_sv_i8_attn_kernel（全任务 1512 次）
+       └─ 3024 个 VisitorAuxLoad residual epilogue
+
+Audio VAE：207 latent frames → 双声道 waveform
+  → FP32 Conv1d/ConvTranspose1d + SnakeBeta + anti-alias filters
+  → 无 INT8/NVFP4 kernel
+
+CreateVideo / SaveVideo
+  → CPU tensor cast + NumPy + PyAV/FFmpeg（不是上述 GPU 推理 kernel）
+```
+
+如果需要从某个模块继续向下看：模型加载见第 3 章，Qwen 见第 4 章，采样见第 6 章，DiT 见第 7–8 章，video VAE 见第 9 章，audio VAE 见第 10 章，offload 与 graph 见第 11 章，原始逐 kernel 数据见第 17 章。
 
 ## 3. 模型是怎样加载的
 
@@ -228,6 +271,97 @@ checkpoint 元数据是逐层 uint8 JSON `.comfy_quant`，由 `_load_quantized_m
 - RoPE inverse-frequency 长度 16；
 - `pdd_steps=1`，本 workflow 不用 PDD 多头路径。
 
+**模型文件、上游与实现引用**
+
+本 workflow 实际使用的是 Comfy-Org 重打包的 FL2VA pruned 模型，而不是直接加载 MiniMax 原始 BF16 目录：
+
+- 模型仓库：[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)；上游来源：[MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3)。
+- 实际 DiT 文件：[minimax_h3_fl2va_pruned_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors)。
+- 本机路径：`ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`，20,970,379,616 bytes。
+- 模型配置：`ComfyUI/comfy/supported_models.py:986` 的 `MiniMaxH3`。
+- 包装类：`ComfyUI/comfy/model_base.py:2226` 的 `MiniMaxH3`，它把模型类型设为 `FLOW_AV`。
+- 真正的网络实现：`ComfyUI/comfy/ldm/minimax/model.py:507` 的 `MiniMaxH3Model`。
+- 视频/音频 latent 格式：`ComfyUI/comfy/latent_formats.py:659` 的 `MiniMaxH3AV`。
+
+这些引用分别回答“权重来自哪里”“选择哪个配置”“创建哪个 Python 类”和“forward 在哪里”，不能只用 `UNETLoader` 这个节点名代替。
+
+**从 checkpoint 到 module tree 的进一步展开**
+
+```text
+UNETLoader.load_unet
+  → folder_paths.get_full_path_or_raise('diffusion_models', unet_name)
+  → comfy.sd.load_diffusion_model(unet_path)
+  → comfy.utils.load_torch_file(..., return_metadata=True)
+  → load_diffusion_model_state_dict
+  → convert_old_quants：将量化配置转换为逐层 .comfy_quant
+  → model_detection.model_config_from_unet
+  → supported_models.MiniMaxH3
+  → model_config.set_inference_dtype
+  → model_config.get_model
+  → model_base.MiniMaxH3.__init__
+  → BaseModel.__init__
+       ├─ pick_operations / custom mixed_precision_ops
+       ├─ MiniMaxH3Model(**unet_config, operations=...)
+       │    ├─ video_patch_proj / audio_patch_proj
+       │    ├─ condition_proj + TokenRefiner(2 layers)
+       │    ├─ TimeEmbedder
+       │    ├─ rope.inv_freq
+       │    ├─ blocks[0..49]（Attention + MLP + AdaLN）
+       │    └─ final_layer(video_out + audio_out)
+       ├─ model_sampling(ModelSamplingAV + CONST)
+       └─ model_type = FLOW_AV
+  → ModelPatcherDynamic
+  → MiniMaxH3.load_model_weights
+  → diffusion_model.load_state_dict(..., assign=True)
+```
+
+`BaseModel.__init__` 对应 `ComfyUI/comfy/model_base.py:173-210`。真正创建 `MiniMaxH3Model` 的语句在该函数创建 `self.diffusion_model` 处；因此不能误以为 `supported_models.MiniMaxH3` 自身就是执行 forward 的网络，它只是配置和工厂。
+
+**量化元数据如何变成真实计算对象**
+
+当前 DiT 的 200 个 `.comfy_quant` 都是：
+
+```json
+{
+  "format": "int8_tensorwise",
+  "convrot": true,
+  "convrot_groupsize": 256,
+  "full_precision_matrix_mult": false
+}
+```
+
+`_load_quantized_module`（`ComfyUI/comfy/ops.py:1342-1485`）据此：
+
+1. 选择 `QUANT_ALGOS['int8_tensorwise']`；
+2. 读出 packed `weight` 和 `weight_scale`；
+3. 把 `convrot=true`、`convrot_groupsize=256` 写入 layout 参数；
+4. 保存原始输出 shape 和 compute dtype；
+5. 创建 `QuantizedTensor(weight, 'TensorWiseINT8Layout', params)`。
+
+在 forward 中，`MixedPrecisionOps.Linear` 对这类格式设置 `quantize_input=False`，表示**不在模块入口直接把输入包装成特定 QuantizedTensor**；而是让 `F.linear(input, QuantizedTensor_weight)` 进入 `QuantizedTensor.__torch_dispatch__`，由 layout 决定激活如何在线量化。
+
+对应的真实 kernel 路径是：
+
+```text
+blocks.i.attn.qkv_proj / out_proj / mlp.fc1 / mlp.fc2
+  → MixedPrecisionOps.Linear.forward
+  → F.linear(input, QuantizedTensor weight, bias)
+  → TensorWiseINT8Layout._handle_int8_linear_tensorwise
+  → torch.ops.comfy_kitchen.int8_linear
+  → comfy_kitchen/backends/cuda/__init__.py:int8_linear
+  → _C.quantize_int8_rowwise_convrot64
+  → _C.cutlass_int8_dequant（本 trace 的大 M 主路径）
+```
+
+这些 C++ binding 来自本机 `.venv/lib/python3.12/site-packages/comfy_kitchen/backends/cuda/_C.abi3.so`，由同目录 Python backend 在导入时加载。trace 中出现的 `comfy::<unnamed>::quantize_int8_rowwise_convrot64_kernel` 和 `cutlass::Kernel2<...signed char...>` 正是这一层，而不是 PyTorch 自带的普通 FP32 `F.linear`。
+
+**本模型实际命中的计算单元**
+
+- 50 个主 DiT block，每个有 4 个上述量化 Linear，20 个去噪 step 共 4000 次 INT8 GEMM；
+- 对应的 4000 次在线 ConvRot 行量化，而不是只反量化一次权重后反复使用；
+- attention 本身不走 INT8 QK^T kernel，而是走 BF16 FlashAttention，详见第 7.6 节；
+- token refiner、patch projection、AdaLN 和 final head 不能根据文件名一并归入这 200 个 INT8 Linear。它们的 dtype 和 kernel 要分别由构造参数和 trace 判断。
+
 ### 3.3 文本编码器的识别与构造
 
 ```text
@@ -250,9 +384,30 @@ nodes.CLIPLoader.load_clip(type='minimax')
 - 50 层而不是原始 64 层；
 - `final_norm=False`、`lm_head=False`。
 
-因此这里不是拿 Qwen 做文本续写，而是取第 50 层 hidden state 作为 H3 条件。日志确认初始化 dtype 为 FP16，但 `SDClipModel.forward` 会对 token embedding 请求 FP32，最后 hidden condition 也 `.float()`；权重与激活实际 GEMM dtype 由 cast 路径随输入对齐。**不能仅凭“CLIP dtype FP16”就写成“每次 NVFP4 反量化后 FP16 GEMM”。**
+因此这里不是拿 Qwen 做文本续写，而是取第 50 层 hidden state 作为 H3 条件。日志确认初始化 dtype 为 FP16，但 `SDClipModel.forward` 会对 token embedding 请求 FP32，最后 hidden condition 也 `.float()`；权重与激活实际 GEMM dtype 由 cast 路径随输入对齐。**不能仅凭“CLIP dtype FP16”就写成“每次 NVFP4 反量化后 FP16 GEMM”。第 17 章实测进一步确认：反量化输出 FP32，后续 GEMM 和 attention 也都走 FP32 kernel。**
+
+**文本模型文件与实现引用**
+
+- 实际文件：[qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors)。
+- 本机路径：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`，15,687,142,551 bytes。
+- H3 专用 tokenization 和 clip 包装：`ComfyUI/comfy/text_encoders/minimax.py:79` 的 `MiniMaxQwen3VL`，以及 `:134` 的 `MiniMaxH3ClipModel`。
+- 通用 Qwen3-VL 实现：`ComfyUI/comfy/text_encoders/qwen3vl.py:51` 的 `Qwen3VL`。
+- 50 层语言模型配置：`ComfyUI/comfy/text_encoders/llama.py:416` 的 `Qwen3VL_32BConfig`；主体为 `:936` 的 `Llama2_`。
+
+`detect_te_model` 识别的是 **Qwen3-VL-32B 裁剪后的 H3 conditioning checkpoint**，不是一个用于对话生成的完整 Qwen。加载后由 `MiniMaxH3TEModel_` 管理 patcher；`MiniMaxH3ClipModel.encode_token_weights` 在返回 hidden states 的同时附加 `minimax_token_tags`。
+
+**量化读取的关键区别**
+
+Qwen 的 350 个 Linear 是 NVFP4 storage，但都有 `full_precision_matrix_mult=true`；另有 1 个 INT8 embedding。`SDClipModel` 又以 `full_precision_mm=True` 创建 mixed precision ops。于是加载阶段形成的是“量化权重对象 + 全精度计算策略”，并不是“NVFP4 activation + NVFP4 weight 的双 FP4 operand”。
 
 ### 3.4 两个 VAE 的识别
+
+**视频与音频 VAE 的模型引用**
+
+- 视频：[minimax_h3_video_vae_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors)，本机 2,811,065,184 bytes；实现为 `ComfyUI/comfy/ldm/minimax/vae.py:565` 的 `MiniMaxH3VideoVAE`，ViT decoder 在 `:378`。
+- 音频：[minimax_h3_audio_vae_fp32.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors)，本机 605,254,808 bytes；实现为 `ComfyUI/comfy/ldm/minimax/audio_vae.py:374` 的 `MiniMaxH3AudioVAE`，BigVGAN 在 `:308`。
+
+`VAELoader.load_vae`（`nodes.py:844-873`）调用 `comfy.sd.VAE`。`sd.py:1050-1147` 根据 state-dict 签名区分：
 
 `VAELoader.load_vae`（`nodes.py:844-873`）调用 `comfy.sd.VAE`。`sd.py:1050-1147` 根据 state-dict 签名区分：
 
@@ -327,6 +482,100 @@ x = residual + x
 
 `self_attn.o_proj` 与 `mlp.down_proj` 还带 `pre_quant_scale`，`MixedPrecisionOps.Linear.forward` 在矩阵乘之前先做逐通道乘法，共 100 个此类 scale。
 
+**每层 shape 与实际 kernel 的对应**
+
+本次 `L=388`，Qwen 的 hidden state 为 `[1,388,5120]`。这既符合 prompt 的实际 token 长度，也被第一个 `vectorized_layer_norm_kernel` 的 gridX=388 所印证。每层计算为：
+
+```text
+Llama2_.forward
+  → embed_tokens（按 token 取行）
+  → compute_freqs_cis / causal mask
+  → for i in 0..49:
+       TransformerBlock.forward
+         → input_layernorm: [1,388,5120]
+         → Attention.forward
+            ├─ q_proj: 5120 → 8192
+            ├─ k_proj: 5120 → 1024
+            ├─ v_proj: 5120 → 1024
+            ├─ q/k RMSNorm + apply_rope_split_half
+            ├─ optimized_attention（64 Q heads / 8 KV heads）
+            └─ o_proj: 8192 → 5120
+         → residual add
+         → post_attention_layernorm
+         → gate_proj/up_proj: 5120 → 25600（两个独立 Linear）
+         → silu(gate) * up
+         → down_proj: 25600 → 5120
+         → residual add
+  → self.norm is None，因此不做 final RMSNorm
+```
+
+注意 `merged_qkv=False`、`merged_mlp=False`。`CombinedLinear` 不支持当前 NVFP4 layout，所以 `combined_qkv.forward` 和 `combined_gate_up` 返回 `NotImplemented`，实际退回上述独立 q/k/v、gate/up 计算。每层 7 个 NVFP4 权重 Linear，共 350 个，不是 4 个。
+
+**真实 kernel 从哪里来**
+
+```text
+quantized NVFP4 weight
+  → Comfy Kitchen TensorCoreNVFP4Layout.dequantize
+  → comfy_kitchen CUDA backend.dequantize_nvfp4
+  → _C.dequantize_nvfp4
+  → dequantize_nvfp4_kernel<..., float, ...>
+
+反量化后的 FP32 activation/weight
+  → PyTorch F.linear
+  → vendor GEMM backend
+  → cutlass3x_sm100_simt_sgemm_f32_...
+
+GQA attention
+  → optimized_attention_for_device
+  → attention_pytorch
+  → comfy.ops.scaled_dot_product_attention
+  → torch.nn.functional.scaled_dot_product_attention
+  → fmha_cutlassF_f32_aligned_64x128_rf_sm80
+```
+
+`dequantize_nvfp4_kernel` 来自 Comfy Kitchen 的 `_C.abi3.so`。后续 `cutlass3x_sm100_simt_sgemm_f32` 和 `fmha_cutlassF_f32` 是 PyTorch 后端启动的 kernel，**不是** Comfy Kitchen 的 `scaled_mm_nvfp4`。后两者名称里的 `f32` 与 trace 直接证明了文本部分使用 FP32 计算。
+
+**按投影类型核对实测 kernel**
+
+| 计算 | 实测 GEMM 次数 | grid（x,y） | 与源码 shape 的关系 |
+|---|---:|---|---|
+| q_proj | 50 | (128,13) | 输出 8192，64×32 tile |
+| k_proj / v_proj | 100 | (16,13) | 各 50，输出 1024 |
+| o_proj | 50 | (40,7) | 8192→5120，128×64 tile |
+| gate_proj / up_proj | 100 | (200,7) | 各 50，输出 25600 |
+| down_proj | 50 | (40,7) | 25600→5120 |
+| 合计 | 350 | — | 50×7 |
+
+o/down 输出维度相同，所以不能仅凭 grid 把每一个实例继续细分；但每类 50 次、总数 350 次以及 `Llama2_` 的调用顺序完全吻合。反量化次数也为 350，平均每次约 76.593 µs，总计约 26.807 ms。
+
+**Qwen attention 的真实 launch 形状**
+
+`fmha_cutlassF_f32_aligned_64x128_rf_sm80` 在 trace 中为：
+
+```text
+grid=(7,64,1)
+block=(32,1,1)
+registersPerThread=251
+dynamicSharedMemory=86016 bytes
+count=50
+```
+
+其中 `ceil(388/64)=7`，64 对应 Q heads。attention 的数学形式仍是：
+
+```text
+Q=[1,64,388,128]
+K/V=[1,8,388,128]
+GQA 扩展/共享 KV head
+scores = causal_mask(QK^T / sqrt(128))
+output = softmax(scores) V
+```
+
+它使用 FP32 memory-efficient attention，不是主 DiT 的 BF16 FlashAttention，也不是 video VAE 的 INT8 attention。每个 Transformer layer 一次，共 50 次。
+
+**Embedding 与其他 op**
+
+INT8 embedding 的 loader 路径是 `dequantize_embedding(qdata, params, input)`，按 token 行读取，而不是先做整张词表的 FP4/FP32 大矩阵乘。`precompute_freqs_cis` 涉及 FP32 `_bmm_outer_product_kernel`、sin/cos、cat、triu mask 和若干 copy/pointwise op。它们是 Qwen 计算链的一部分，不能与 NVFP4 权重量化混为一谈。
+
 ### 4.4 最重要的量化纠正：本流程不是 FP4 GEMM
 
 **[checkpoint 实测]** 350 个 NVFP4 Linear 全部是：
@@ -349,7 +598,13 @@ NVFP4 packed weight + weight_scale(block, FP8 E4M3) + weight_scale_2(tensor, FP3
 
 如果走快速 NVFP4 GEMM，`tensor/nvfp4.py:212-260` 会要求输入和权重都是 NVFP4 QuantizedTensor，然后调用 `ck.scaled_mm_nvfp4`，再进入 `_C.cublas_gemm_blockwise_fp4`。**当前元数据和 full-precision 设置使这条路径不成立。**
 
-NVFP4 仍减少权重存储与 host/device 传输量，但不能因此声称本流程利用 Blackwell FP4 Tensor Core 完成文本大矩阵乘。底层反量化后 `F.linear` 的库和具体 cuBLAS kernel 仍需 profiler 才能精确命名。
+NVFP4 仍减少权重存储与 host/device 传输量，但不能因此声称本流程利用 Blackwell FP4 Tensor Core 完成文本大矩阵乘。第 17 章已实测确认：350 次 `dequantize_nvfp4_kernel` 后是 350 次 FP32 `cutlass3x_sm100_simt_sgemm_f32`，而不是 `scaled_mm_nvfp4`。
+
+**为什么 `use_quantized_matmul` 也不能直接改变这条路径**
+
+`_load_quantized_module` 同时保存 `_full_precision_mm_config`。`MixedPrecisionOp.can_use_quantized_matmul`（`ComfyUI/comfy/ops.py:1535-1539`）要求 `not self._full_precision_mm_config`，所以当前 350 层即使进入该 context，也不会被重新允许做 FP4 GEMM。
+
+即使另外构造一条量化路径，`tensor/nvfp4.py:222-225` 的快速 `linear` 仍要求输入和权重都为 NVFP4 `QuantizedTensor`；任一不是时回退为反量化参数后普通 `F.linear`。因此这次没有 `scaled_mm_nvfp4` 不是 B200 缺 kernel，而是 **checkpoint 标志 + loader 策略 + 双 operand 前提共同决定**。CUPTI 则证明实际命中的是 NVFP4 反量化与 FP32 GEMM。
 
 ## 5. 空 AV latent、噪声和两种“pack”
 
@@ -472,6 +727,33 @@ SamplerCustomAdvanced.execute
 - `eta=0`，因此 ancestral `sigma_up=0`，**step 中不另加噪声**。随机数只用于初始 noise。
 
 这些是普通 tensor 运算：`log`、`exp/expm1`、乘加、除法、`nan_to_num`、slice/view。不存在名为“res_multistep CUDA kernel”的单一底层算子。
+
+**一次 sigma 调用到 DiT 的完整函数链**
+
+```text
+KSAMPLER.sample
+  → sample_res_multistep / res_multistep（20 次循环）
+  → KSamplerX0Inpaint.__call__(x, sigma, denoise_mask=None)
+  → CFGGuider.outer_predict_noise / predict_noise
+  → sampling_function(cfg=1)
+  → calc_cond_batch（只有 positive）
+  → BaseModel.apply_model / _apply_model
+  → MiniMaxH3Model.forward / _forward
+  → model_sampling.calculate_denoised
+  → res_multistep 的 Euler 或二阶更新
+```
+
+`model_wrap.inner_model.model_sampling.noise_scaling` 在循环外先形成初始 `x_sigma`，循环内每步由 `model()` 返回 `denoised`。首个有效 step 和 `sigma_down==0` 的末 step 用 Euler，其余中间 step 使用上一步 `denoised` 做二阶 multistep。`eta=0`，所以 `sigma_up=0`，step 内不加新的 ancestral noise。
+
+**采样器的实测 kernel 与 NVTX 归属**
+
+`H3.sampler.res_multistep` 覆盖整个采样父区间。将 20 个 `H3.dit.step.NN` 子区间单独归类后，scheduler/其他工作有 1067 个 kernel，总 GPU work 约 2.742 ms。实测类型包括：
+
+- `expm1`、`exp`、`log`、`nan_to_num`；
+- `add`、`mul`、`div`、`neg`；
+- `CatArrayBatchedCopy`、copy、fill 和若干小规模 TensorIterator kernel。
+
+这与 `res_multistep` 的公式逐项对应，不能把它误认为一个专用的“多步采样 CUDA kernel”。父区间本身约 211.329 s，还包括 20 次模型 forward、权重准备、同步和 host 等待，不能用这 2.742 ms 代替采样时间。
 
 ### 6.4 为什么没有 CFG 双分支
 
@@ -642,6 +924,72 @@ fc2: 14336 → 5376
 
 `comfy.ops.linear_input_act` 允许把 SwiGLU 合并进 fc2 的在线激活量化；无法融合时退回显式 SwiGLU + Linear。它是 dispatch helper，不代表永远存在一个同时完成 fc2、SwiGLU、量化、residual 的单独大 kernel。
 
+**四类主 Linear 的 shape、kernel 类型与数学计算**
+
+本次 M=15,787。下面把 Python 层、真实 kernel 和矩阵形状放在一张表中；每类都执行 20×50=1000 次，总计 4000 次。
+
+| Linear | 输入形状 [M,K] | 输出 N | 实测 INT8 GEMM 路径 | 激活量化路径 |
+|---|---|---:|---|---|
+| `attn.qkv_proj` | [15787,5376] | 21504 | identity swizzle，BF16 output | code0，block_threads=256 |
+| `attn.out_proj` | [15787,7168] | 5376 | LeanStreamKT，BF16 output | code0，block_threads=512 |
+| `mlp.fc1` | [15787,5376] | 28672 | identity swizzle，BF16 output | code0，block_threads=256 |
+| `mlp.fc2` | [15787,14336] | 5376 | LeanStreamKT，BF16 output | code2=SwiGLU，block_threads=1024 |
+
+`qkv/fc1` 合计 2000 个 identity 类 kernel，gridY 分别为 84 和 112；`out/fc2` 合计 2000 个 LeanStreamKT 类 kernel。两种 swizzle 是不同的工作划分/调度策略，不改变 Linear 的数学意义，也不表示两套量化格式。
+
+INT8 部分可概括为：
+
+```text
+W_rot,q, s_w = offline_convrot_quantize(W, group=256)
+x_rot       = H x
+x_q, s_x    = per_row_int8_quantize(x_rot)
+Y           = int8_GEMM(x_q, W_rot,q^T) * (s_x s_w)
+fc2 输入处  = SwiGLU(fc1 输出)，其 code2 在激活量化前完成
+```
+
+`(Hx)(Hw)^T = xw^T` 在理想实数运算中保持内积；旋转的作用是改善待量化数据的分布，随后仍有 INT8 舍入误差。CUTLASS 模板中输入为 `signed char`，累加/scale 使用 `int/float`，最终输出 `cutlass::bfloat16_t`。这和“BF16 hidden state”并不矛盾：权重与 GEMM 的输入是 INT8，输出再回到 BF16 stream。
+
+**kernel 的来源与 dispatch 细节**
+
+```text
+DiTBlock.forward
+  → MixedPrecisionOps.Linear.forward
+  → F.linear
+  → QuantizedTensor.__torch_dispatch__
+  → TensorWiseINT8Layout._handle_int8_linear_tensorwise
+  → torch.ops.comfy_kitchen.int8_linear
+  → backends/cuda/__init__.py:int8_linear
+       ├─ _C.quantize_int8_rowwise_convrot64
+       └─ _C.cutlass_int8_dequant
+```
+
+其中：
+
+- `_C.quantize_int8_rowwise_convrot64` 对应 trace 中的 `comfy::<unnamed>::quantize_int8_rowwise_convrot64_kernel`；
+- `_C.cutlass_int8_dequant` 对应 `cutlass::Kernel2<...signed char...>`；
+- 两者均来自 Comfy Kitchen 的 `_C.abi3.so`，不是 `scaled_mm_nvfp4`，也不是 ATen 的普通 `mm`；
+- `code2` 经 `backends/_activations.py:25-30` 确认为 SwiGLU；`code3` 是 RMSNorm，用于 video VAE 的 qkv/ff.w1；
+- 本 DiT 这四类 Linear 没有 bias，主 residual 由后面的 `_mod_gate` 单独做 `addcmul`，所以不应把 VAE 的 `VisitorAuxLoad` residual 规则套到主 DiT 上。
+
+**每个 DiTBlock 的真实计算顺序**
+
+```text
+adaln_proj(t_emb)
+  → norm1 + modality scale/shift
+  → INT8 qkv_proj
+  → split Q/K/V
+  → fused RMSNorm + partial RoPE
+  → BF16 FlashAttention
+  → INT8 out_proj
+  → gate_msa × attention + residual（addcmul）
+  → norm2 + modality scale/shift
+  → INT8 fc1
+  → SwiGLU + INT8 fc2
+  → gate_mlp × MLP + residual（addcmul）
+```
+
+每个 block 的 attention+MLP 是 4 次 INT8 GEMM；20 步、50 层形成 4000 次。`_mod_gate` 按 text/audio/video 三个 segment 执行，故 `addcmul` 为 `20×50×2×3=6000` 次。
+
 ### 7.6 attention 是单流 full self-attention
 
 H3 的主 `Attention.forward` 传 `mask=None`，所以文本、音频和视频 token 都能直接相互注意。这不是：
@@ -659,8 +1007,39 @@ optimized_attention
   → attention_pytorch（本机日志明确选择）
   → comfy.ops.scaled_dot_product_attention
   → torch.nn.functional.scaled_dot_product_attention
-  → PyTorch 运行时选择 SDPA backend（未 trace，不写死）
+  → 第 17 章实测：pytorch_flash::flash_fwd_kernel（BF16）
 ```
+
+**FlashAttention 的真实 kernel 与 launch 形状**
+
+实测 kernel 为：
+
+```text
+void pytorch_flash::flash_fwd_kernel<
+  Flash_fwd_kernel_traits<128,128,64,4,...,
+  cutlass::bfloat16_t,...>>(pytorch_flash::Flash_fwd_params)
+```
+
+主 DiT 的一次调用参数为：
+
+```text
+grid=(124,1,56)
+block=(128,1,1)
+registersPerThread=255
+dynamicSharedMemory=65536 bytes
+```
+
+`ceil(15787/128)=124` 是 Q 方向 128-token tile 的数量，56 是 attention head 数。文本 refiner 因 `ceil(388/128)=4`，对应 grid=(4,1,56)，共 2 次。主 DiT 为 `20×50=1000` 次，平均每次约 17.660879 ms；refiner 的两次合计只有约 0.061 ms。
+
+这个 kernel 是 **PyTorch 内置 FlashAttention CUDA backend**，由 `F.scaled_dot_product_attention` 选择，不是 H3 Python 文件里手写的 kernel，也不是 Comfy Kitchen 的 `ck.int8_attention`。其计算仍是：
+
+```text
+Q,K,V ∈ BF16，形状 [1,56,15787,128]
+scores = QK^T / sqrt(128)
+output = softmax(scores) V
+```
+
+没有 mask，所以 text、audio、video 相互注意。FlashAttention 用分块和 online softmax 计算注意力，避免把完整的 `[56,15787,15787]` score matrix 常驻显存；这与“数学上是 full self-attention”并不矛盾。
 
 主 attention 不是 `ck.int8_attention`；后者出现在量化 video VAE decoder 的特定分支。
 
@@ -677,6 +1056,14 @@ optimized_attention
 7. 返回负的 video/audio 输出。
 
 源码构造上把 patch projection 和 output head 作为 FP32 边界处理，但具体权重访问仍受 mixed precision/cast 管理。因此应避免“全 DiT 都是 BF16 GEMM”或“所有非量化权重始终 FP32 常驻”这两种过度概括。
+
+**final head 的实测补充**
+
+`FinalLayer` 每一步分别调用 video/audio output head，`_modulate` 先把 hidden 转为 FP32。trace 中每个 DiT step 还出现一个 `cutlass_80_simt_sgemm_128x32_8x5_tn_align1`，共 20 个。因此主 DiT 的 `cutlass::Kernel2` 总数是 4020，而不是全部为 INT8 的 4000。
+
+这 20 个是非 INT8 的单精度 GEMM，不计入四类主 INT8 Linear 的 4000 次；也不能因为模板没有显式写出 BF16 就误称 FP16。两个 output head 的其它 GEMM backend 仍按各自 shape/dtype 选择，不能把这一个 SGEMM 的次数当成全部 final-head 调用数。
+
+`model_output=-velocity` 最后经 `CONST.calculate_denoised` 得到 `x0=model_input-σ·model_output`。因此 VAE 收到的是 20 步积分后的 latent，而不是某一层 attention 或某个 final-head kernel 的直接输出。
 
 ## 8. Kernel/op 专题：量化、融合与回退
 
@@ -731,7 +1118,7 @@ comfy.ops.linear_input_act
 6. 不满足时回退 `_C.cublas_gemm_int8`（INT32 accumulator）+ `_C.dequantize_int8_linear`；
 7. Python/eager fallback 则分解为普通 PyTorch op。
 
-DiT 的 M 是 15,399+L，远大于 GEMV 分支，因此静态上应看大 M 的量化 + CUTLASS/cuBLAS 分支，而不是 M=1 kernel。**实际这次是否命中某个 C++ binding，仍需要动态 profiler 证实。**
+DiT 的 M 是 15,399+L，远大于 GEMV 分支，因此静态上应看大 M 的量化 + CUTLASS/cuBLAS 分支，而不是 M=1 kernel。第 17 章进一步实测：本次 L=388、M=15,787，4000 次主 INT8 Linear 都命中了在线 ConvRot 和 CUTLASS INT8 kernel。
 
 ### 8.3 `linear_input_act` 到底能融合什么
 
@@ -768,7 +1155,7 @@ H3 DiT 的 Q/K 同 shape，静态走 paired 候选；Qwen 的 Q 64 heads、K 8 h
 
 `attention_pytorch` 只负责 reshape、mask 处理和调用 PyTorch SDPA。`comfy/ops.py:58-105` 还会处理 GQA 与部分 backend priority/contiguous 情况。
 
-因此主 DiT 的 attention 算法复杂度仍约为 O(S²)，但不一定在显存中实体化 `[56,S,S]` score matrix。若使用 fused SDPA backend，可通过 tiling 避免完整分数矩阵常驻；若回退 math backend，则可能实体化大矩阵。没有实际 backend trace 就不能断言哪种内存行为和 kernel。
+因此主 DiT 的 attention 算法复杂度仍约为 O(S²)，但不一定在显存中实体化 `[56,S,S]` score matrix。若使用 fused SDPA backend，可通过 tiling 避免完整分数矩阵常驻；若回退 math backend，则可能实体化大矩阵。第 17 章已确认本次命中 BF16 FlashAttention；其他 dtype、其他 workflow 或其他后端仍需分别采集，不能把这一结论外推到所有运行。
 
 近似规模只用于理解，不是测量：
 
@@ -790,13 +1177,37 @@ to_qkv.weight 是 QuantizedTensor
 
 时调用 `ck.int8_attention`，否则回退 `optimized_attention`。
 
-当前 36 层 ViT decoder 的 `to_qkv` 都是 INT8 ConvRot，且本机 Kitchen 支持 int8 attention，因此静态条件满足。Kitchen `sage_attention.py:597-636` 描述这条路径为：
+当前 36 层 ViT decoder 的 `to_qkv` 都是 INT8 ConvRot，且本机 Kitchen 支持 int8 attention。第 17 章实际采集到 1512 个 `qk_int_sv_i8_attn_kernel`，证实这条路径确实执行。Kitchen `sage_attention.py:597-636` 描述这条路径为：
 
 - Q/K/V signed INT8，attention probability unsigned INT8；
 - Q/K 使用保持内积的 block-Hadamard rotation；
 - softmax 的 max、exp、denominator、reciprocal 和 V-scale 使用 FP32；
 - 不分配 FP8 tensor、不执行 FP8 MMA；
 - C++ binding 为 `_cuda_backend._C.sage_sdpa`。
+
+**Sage/INT8 attention 的来源与 launch 证据**
+
+`comfy_kitchen/sage_attention.py:_int8_attention_cuda` 先校验/整理 Q/K/V，分配 `q_int8`、`k_int8`、`v_int8` 和 block scales，再调用 `_C.sage_sdpa`。trace 中的 `quant_qk_fused`、`quant_v_int8_kernel`、`detect_k_anchor` 和 `qk_int_sv_i8_attn_kernel` 正是这条路径的组成部分，而不只是一个名为 attention 的抽象 op。
+
+```text
+Q/K：共享 block-Hadamard rotation → INT8，保持理想内积并减小 outlier
+V：单独 INT8 量化
+QK^T：整数 attention kernel
+softmax 的 max/exp/denominator/reciprocal 与 V scale：FP32
+输出：恢复到 VAE 的 FP16 hidden stream，再做 to_out + residual
+```
+
+源码明确说明这条路径不分配 FP8 tensor，也不执行 FP8 MMA。它与主 DiT 的 BF16 FlashAttention 是不同 kernel 家族。
+
+实测每次 VAE INT8 attention 的 launch 为：
+
+```text
+batch=1 tile：grid=(15,32,1)，block=(32,1,1)
+batch=4 tiles：grid=(15,32,4)，block=(32,1,1)
+registersPerThread=244，dynamicSharedMemory=16384 bytes
+```
+
+每个 tile 有 `7×16×16+5=1797` 个 token，`ceil(1797/128)=15`；Y=32 为 head 数，Z=1/4 为合 batch tile 数。42 次 ViT×36 层得到 1512 个 `qk_int_sv_i8_attn_kernel`，合计约 284.758 ms，平均约 188.332 µs。
 
 这和主 DiT 的 SDPA 是两条不同路径，不能混写。
 
@@ -882,6 +1293,60 @@ x = h
 
 `x_embedder`、`proj_out`、`post_quant_conv`、register tokens 不属于这 144 个量化权重。VAE 尾部还执行 `nan_to_num`，用于清理异常值。
 
+**ViT 四类 Linear 的 shape 与实测 kernel**
+
+每个空间 tile 有 7 个时间 latent、16×16 空间 latent，再加 4 个 register tokens 和 1 个 suffix：
+
+```text
+M_single = 7×16×16 + 5 = 1797
+M_batch4 = 4×1797 = 7188
+```
+
+trace 中 `to_qkv` 的 ConvRot grid 正是 1797 或 7188，因此 tile 合 batch 不再只是源码推测。四类 Linear 为：
+
+| Linear | K | N | 输入预处理 | residual/epilogue | 每种调用次数 |
+|---|---:|---:|---|---|---:|
+| `attn.to_qkv` | 2048 | 6144 | RMSNorm，code3 | 无 AuxLoad | 1512 |
+| `attn.to_out` | 2048 | 2048 | 无输入激活，code0 | `VisitorAuxLoad` | 1512 |
+| `ff.w1` | 2048 | 16384 | RMSNorm，code3 | 无 AuxLoad | 1512 |
+| `ff.w2` | 8192 | 2048 | SwiGLU，code2 | `VisitorAuxLoad` | 1512 |
+
+`to_qkv` 的 gridY=24、`ff.w1` 的 gridY=64，分别与 N=6144/256、N=16384/256 对应。每类次数是 `42 ViT×36 blocks=1512`，总计 6048。
+
+**带 residual 的真实计算**
+
+`to_out` 与 `ff.w2` 传入 `residual=x` 和逐通道 `residual_scale`。在 dtype 与 16-byte 对齐满足时，CUDA `int8_linear` 选择：
+
+```text
+_C.cutlass_int8_dequant_residual
+  → cutlass::Kernel2<... VisitorAuxLoad ...>
+  → Y = residual + residual_scale × INT8_GEMM(x_q,W_q^T)
+```
+
+trace 中带 `VisitorAuxLoad` 和不带者各 3024 个，正好与 `to_out/ff.w2` 和 `to_qkv/ff.w1` 两组对应。这与主 DiT 在外层用 `_mod_gate` 做 `addcmul` 不同，不能把两者的 residual 路径混为一谈。
+
+**一次 ViT forward 的函数/kernel 链**
+
+```text
+MiniMaxH3VideoVAE._decode_pixels
+  → post_quant_conv（非那 144 个 INT8 Linear）
+  → ViT3DDecoder.forward
+     ├─ x_embedder
+     ├─ register/suffix token 拼接与 3D RoPE table
+     ├─ 36 × TransformerBlock
+     │    ├─ linear_input_act(to_qkv, 'rms_norm')
+     │    ├─ fused RMSNorm + RoPE
+     │    ├─ quant_qk_fused / quant_v_int8 / detect_k_anchor
+     │    ├─ qk_int_sv_i8_attn_kernel
+     │    ├─ linear_input_act(to_out, residual=scale1)
+     │    ├─ linear_input_act(ff.w1, 'rms_norm')
+     │    └─ linear_input_act(ff.w2, 'swiglu', residual=scale2)
+     ├─ norm_out + proj_out
+     └─ unpatchify → 每个 temporal chunk 的 RGB 片段
+```
+
+INT8 attention 之后还有 `nan_to_num`。常规一次 ViT 是 648 个 kernel，第一次因初始化额外多出 144 个，共 792 个；不能用首次 kernel 数概括所有 tile。
+
 ### 9.3 时间 chunk：37 latent 如何恢复成 124 帧
 
 默认参数：
@@ -931,6 +1396,21 @@ W=864：start=[0,144,288,448,608]，overlap=[112,112,96,96]，5 个 tile
 - 实际 batch 取决于每次调用时的可用显存。
 
 这是视频 decode 显存峰值仍高于其他阶段的原因之一：权重按需驻留、较大 ViT attention、多个 tile 的中间激活和 decoder 临时 buffer 同时存在，而不是只由那 2.62 GB 的 VAE 文件决定。
+
+**42 次实际 decoder 调用是怎样形成的**
+
+CUPTI 的 `H3.video_vae.vit.01..42` 与上述公式完全吻合：
+
+```text
+7 个 temporal chunks
+× 3 个高度 tile rows
+× 每个 row 的宽度 5 tiles 按 4+1 合 batch
+= 42 次 ViT forward
+```
+
+`ViT.02` 的 activation grid M=1797，对应单个 tile；`ViT.05` 的 M=7188，对应 4 个 tile 合 batch。每个 tile 都被当作 ViT batch 维的一个样本，而不是重新创建一个 VAE 模型。42 次调用合计 6048 次 INT8 Linear、1512 次 INT8 attention。
+
+外层 `H3.video_vae.decode` 约 25.427 s，其中第一次 ViT 的冷执行约 22.379 s；后续 41 次大多只有几十毫秒。`memcpy` 也呈现相同差异：第一次 ViT 约 4.869 GB，后续常规每次仅 16 KiB。由此可见视频 VAE 的冷初始化/首次权重准备与稳态 tile 计算必须分开讨论。
 
 ### 9.5 本 T2V 没有执行的 video VAE 代码
 
@@ -1015,6 +1495,23 @@ alpha、beta 在 checkpoint 中以 log scale 保存，前向时 `exp` 后使用�
 
 本模型使用普通 `ops.Conv1d/ConvTranspose1d` 的 FP32 权重，没有 audio VAE 量化元数据，也没有 int8 attention。
 
+**实测 kernel 与模块的对应**
+
+`H3.audio_vae.decode` 中共有 2679 个 kernel，GPU work 约 34.288 ms，host range 约 3.050 s，memcpy 约 259.412 MB。没有出现 `nvfp4` 或 `int8` kernel，和 audio VAE 的 FP32 文件、loader dtype 一致。
+
+几个可核对的关系：
+
+- `sin_kernel` 为 127 次，恰好等于 `7 stages × 3 AMPBlocks × 6 anti-aliased activations + 1 final activation`；
+- `replication_pad_forward_kernel1d` 为 254 次，等于每个 activation 的 UpSample/LowPassFilter 两侧 padding；
+- cuDNN `dgrad2d_grouped_direct_kernel` 为 127 次，合计约 11.757 ms，服务于转置卷积的 data-gradient 形式实现；
+- 其余是 `conv_depthwise2d_forward_kernel_generic`、`implicit_convolve_sgemm`、Snake 的 exp/sin、residual add、copy 和 cast。
+
+`dgrad` 不代表训练 backward，而是 BigVGAN 前向 ConvTranspose1d 的底层计算方式。转置卷积在这里是学习参数的上采样，不是简单的线性插值；Anti-aliased activation 则把“上采样→SnakeBeta→低通下采样”串起来。
+
+**本次不会出现的 audio encoder kernel**
+
+源码 `MiniMaxH3AudioVAE.encode` 里的 DAC encoder、`AttnProjection` 和 causal attention 只在输入参考音频时执行。本 T2V 从联合 DiT 生成 audio latent 后直接 decode，所以 audio 阶段没有 encoder attention，也没有语音/音乐单独生成的第二个 DiT。
+
 ### 10.4 输出缩放与未执行的 encoder
 
 `vae_decode_audio` 对 waveform 计算：
@@ -1053,6 +1550,33 @@ Audio VAE            576 MB
 
 这些是 patcher 管理的模型规模，不是同一时刻物理 GPU 驻留量。实际 NVML 峰值为 38570 MiB，出现在 video VAE decode；不能把四者 staged 值简单相加当作峰值，也不能把权重文件大小当作推理 activation。
 
+**CUPTI 看到的实际驻留/传输差异**
+
+| 阶段 | memcpy（十进制） | 与权重/执行的关系 |
+|---|---:|---|
+| Qwen | 15.237 GB | 文本权重首次准备、host/device 传输与 cast |
+| text refiner | 1.596 GB | DiT 的 condition/refiner 首次准备 |
+| DiT step.01 | 19.626 GB | 主 DiT 首次准备和初始化 |
+| DiT step.02..20（每步） | 175.701 MB | 热执行时仍有部分权重/streaming 工作，但不是每步重传整份 20 GB 模型 |
+| audio VAE decode | 259.412 MB | audio 权重、activation 和输出相关工作 |
+| video VAE 外层 decode | 617.103 MB | latent、帧 buffer 和 decode 外层工作 |
+| video ViT.01 | 4.869 GB | video VAE 首次准备和初始化 |
+| video ViT.02..42（常规每次） | 16 KiB | 热 tile 的传输明显不同于首次 decoder |
+
+全部 trace 有 5596 次 memcpy、46,506,971,601 bytes。该数字包括多种传输方向和空间，不是“从磁盘读取模型”的同义词，也不是每步权重流量。
+
+host API 进一步说明初始化成本：
+
+- `cudaMemsetAsync` 4293 次，host total 约 13.764 s；
+- `cudaStreamSynchronize` 1038 次，约 10.573 s；
+- `cudaHostRegister` 852 次，约 8.194 s；
+- `cudaLaunchKernel` 93,597 次，约 6.718 s；
+- `cuMemCreate` 1153 次，约 3.140 s；
+- `cuMemSetAccess` 1153 次，约 1.453 s；
+- `cudaMallocAsync` 99,972 次，约 0.692 s。
+
+Qwen 的 `cudaHostRegister` 为 2.979 s，DiT 首步为 4.034 s。上述 host API 时间与 kernel work、memcpy 都不能直接相加为 wall time；磁盘/mmap page fault、Python 模型结构处理和部分 host 等待不在 CUPTI kernel trace 内。
+
 ### 11.2 DiT block prefetch
 
 `MiniMaxH3.extra_conds` 最终让 `BaseModel._apply_model` 在 `transformer_options` 中设置 `prefetch_dynamic_vbars=True`。`_run_blocks` 建立：
@@ -1086,6 +1610,10 @@ malloc_graph_end
 它记录/管理分配，预分配 video/audio 输出，并处理分配图的生命周期。`_run_blocks` 的 `prefetch_queue_pop` 没有传 `enable_graph=True`，因此不能声称 50 个 block 被整体 `torch.cuda.CUDAGraph` 捕获并 replay。
 
 本日志为 `Comfy model compiler graph breaks: 1, rogues: 0`。这也不能自动翻译成“模型经过了 torch.compile”。本分析中没有一个依赖 `torch.compile` 才能成立的调用链。
+
+**真实 trace 对 graph 的进一步约束**
+
+本次以 `--cuda-graph-trace=node` 采集，95,226 个 kernel 的 `graphNodeId` 全部为空。也就是说，这次没有观察到 CUDA Graph node kernel，不能把 `malloc_graph_begin/end` 或日志里的 `Comfy model compiler graph breaks: 1` 解读为“50 层 DiT 被整体捕获后 replay”。该结论只针对本次实际 trace，不能排除其它模型或其它配置启用 graph 的情况。
 
 ### 11.4 与 tensor/op 直接相关的内存行为
 
@@ -1122,6 +1650,12 @@ ceil((32000/24) * 124) = 165334 samples
 
 这些主要是 CPU、NumPy、PyAV 和 FFmpeg 操作，不属于 DiT/VAE 的 GPU kernel。实际输出检查确认 124 帧、24 fps、32 kHz 双声道音频，与这条路径吻合。
 
+**本次 profiling 的实际输出验证**
+
+独立 profiling 实例将输出隔离到 `logs/cupti_h3_t2v/output/video/MiniMax_H3_00001_.mp4`。PyAV 实测为：H.264、864×480、24 fps、124 帧、约 5.166688 秒；AAC、32 kHz、双声道。证明以上 kernel 链路确实完成并保存了音视频，而不只是采集到若干初始化操作。
+
+CUPTI 主要收集 CUDA/CUPTI 与 NVTX 数据，CPU 的 NumPy/PyAV/FFmpeg 编码不会以 DiT/VAE 的 GPU kernel 形式出现。没有 `H3.save_video` 对应的模型 kernel 不是保存失败；成功与否由 history、run_result 和实际媒体文件共同确认。
+
 ## 13. 按模块汇总：函数、op 与确定性
 
 ### 13.1 本次实际路径的高层调用清单
@@ -1135,12 +1669,34 @@ ceil((32000/24) * 124) = 165334 samples
 | 空 latent/noise | `_empty_av_latent`、`prepare_noise` | `zeros`、CPU `randn`、`NestedTensor` | V=[1,24,37,30,54]，A=[1,32,2,207] | 实际参数推导 |
 | 调度 | `simple_scheduler`、`time_shift_sigma` | 标量/tensor 算术 | 21 个 video sigma（含 0） | 非专用 sampler kernel |
 | 主采样 | `sample_res_multistep` | Euler + 二阶 multistep、`exp/expm1`、乘加 | 20 次 DiT | `eta=0`，无额外噪声 |
-| DiT packed attention | `Attention.forward` ×50×20 | INT8 QKV/out Linear、RMS+RoPE、PyTorch SDPA | 1000 次；[1,56,S,128] | 具体 SDPA backend 未 trace |
+| DiT packed attention | `Attention.forward` ×50×20 | INT8 QKV/out Linear、RMS+RoPE、PyTorch SDPA | 1000 次；[1,56,S,128] | 第 17 章实测 BF16 FlashAttention |
 | DiT MLP | `MLP.forward` ×50×20 | INT8 fc1、SwiGLU、INT8 fc2 | 4000 个主 block INT8 Linear（含 attention） | 融合取决于 shape/backend |
 | AdaLN/final | `AdalnProj`、`FinalLayer` | 普通 Linear、RMSNorm、分段乘加、unpack | 每步每层均执行 | 不属于那 200 个 INT8 Linear |
 | Video VAE | `decode_temporal` + `tiled_decode` | 1×1×1 conv、36 层 ViT、INT8 attention、RMS+RoPE、blend | 7 temporal chunks，每 chunk 15 空间 tiles | decoder batch 随 free VRAM 变化 |
 | Audio VAE | `MiniMaxH3AudioVAE.decode` | FP32 Conv1d/ConvTranspose1d、Snake、抗混叠滤波 | 2 声道，207→165600 samples | 无 encoder attention |
 | 保存 | `VideoFromComponents.save_to` | CPU cast/NumPy、PyAV H.264/AAC | 124 帧、32 kHz stereo | 非 GPU 推理 kernel |
+
+**真实 kernel 来源、对应模块与次数总表**
+
+| 模块 | 真实 kernel / binding | 来源 | 本次次数与作用 |
+|---|---|---|---|
+| Qwen 反量化 | `dequantize_nvfp4_kernel` / `_C.dequantize_nvfp4` | Comfy Kitchen `_C.abi3.so` | 350，NVFP4 权重转 FP32 |
+| Qwen Linear | `cutlass3x_sm100_simt_sgemm_f32` | PyTorch `F.linear` 的 vendor GEMM backend | 350，q/k/v/o 与 gate/up/down |
+| Qwen attention | `fmha_cutlassF_f32_aligned_64x128_rf_sm80` | PyTorch SDPA 的 mem-efficient backend | 50，FP32 causal GQA |
+| DiT attention | `pytorch_flash::flash_fwd_kernel` | PyTorch SDPA 的 FlashAttention backend | 1000 主 DiT + 2 refiner，BF16 full self-attention |
+| DiT 主 Linear | `cutlass::Kernel2<...signed char...>` / `_C.cutlass_int8_dequant` | Comfy Kitchen `_C.abi3.so` | 4000，四类主 INT8 投影 |
+| DiT 激活量化 | `quantize_int8_rowwise_convrot64_kernel` / `_C.quantize_int8_rowwise_convrot64` | Comfy Kitchen `_C.abi3.so` | 4000，ConvRot 与逐行 INT8 量化 |
+| DiT 其他 GEMM | `cutlass_80_simt_sgemm` | 非 INT8 的 vendor 单精度路径 | 20，不计入 4000 个 INT8 GEMM |
+| RMSNorm + RoPE | `comfy::rope_kernel` / `_C.rms_rope` | Comfy Kitchen `_C.abi3.so` | 1000 主 DiT BF16；video VAE 另有 FP16 |
+| VAE 主 Linear | INT8 `cutlass::Kernel2` | Comfy Kitchen `_C.abi3.so` | 6048，to_qkv/to_out/ff.w1/ff.w2 |
+| VAE residual | 带 `VisitorAuxLoad` 的 CUTLASS / `_C.cutlass_int8_dequant_residual` | Comfy Kitchen `_C.abi3.so` | 3024，to_out/ff.w2 的 residual scale |
+| VAE attention | `qk_int_sv_i8_attn_kernel` / `_C.sage_sdpa` | Comfy Kitchen Sage backend | 1512，42×36 层 INT8 attention |
+| VAE attention 量化 | `quant_qk_fused`、`quant_v_int8_kernel`、`detect_k_anchor` | Comfy Kitchen Sage backend | 各 1512，Q/K/V 与 anchor 处理 |
+| DiT 调制 residual | `at::native::addcmul_cuda_kernel` | PyTorch ATen | 6000，20×50×2×3 个 modality 段 |
+| 普通浮点 GEMM | `nvjet_sm100_*`、其它 `cutlass3x_*` | PyTorch/vendor backend | refiner、time/patch/final/非量化路径，不能与 INT8 混算 |
+| Audio VAE | `dgrad2d_grouped_direct_kernel`、depthwise conv、`sin_kernel` 等 | PyTorch ATen/cuDNN | FP32 BigVGAN，未出现量化 kernel |
+
+完整 155 种 kernel 不在正文逐一罗列，避免把大量 copy/cast/fill 与核心模型计算混在一起；完整名称、次数、grid/block、寄存器、shared memory、stream 和 NVTX 归属见 `logs/cupti_h3_t2v/analysis/kernel_events.csv.gz` 与 `global_kernel_summary.csv`。
 
 ### 13.2 结构性调用次数，不等于 kernel launch 次数
 
@@ -1197,9 +1753,15 @@ Audio VAE upsample stage               7 次（每声道共用权重、分别计
 
 因此不能只用“B200 上 50 层 Transformer 的理论 FLOPs”解释 15 分钟总耗时，也不能把首次反量化/加载成本平摊成每个 DiT kernel 的固定开销。
 
+**真实 DiT kernel work 的构成**
+
+全部 20 步 DiT kernel work 为 34.030 s，其中 BF16 FlashAttention 约占 51.9%，INT8 CUTLASS GEMM 约占 36.5%，ConvRot 在线量化约占 5.1%，fused RMSNorm+RoPE 约占 2.1%，其他 op 约占 4.4%。这是 20 步累计 GPU work 的占比，不是某一步 wall time 的严格分解。
+
+本次采样日志仍显示第一步初始化约 178.62 s、后续每步约 1.71–1.76 s。不同运行、不同 host cache 下的总时间不可直接横比；要知道 kernel 本身在算什么，应优先看 CUPTI 中的类型和 launch 参数，而不是用总时间猜某个 kernel 的快慢。
+
 ### 14.2 packed self-attention 的规模与内存不能混为一谈
 
-S≈15,399+L 时，attention 的算术复杂度是 O(S²)，但 fused backend 可能只保存 tile 级中间状态。权重压缩也不等价于 activation 压缩：
+本次实测 S=15,787（L=388），attention 的算术复杂度是 O(S²)，但 fused backend 可能只保存 tile 级中间状态。权重压缩也不等价于 activation 压缩：
 
 - INT8 主权重减少存储和传输，但主 hidden/QKV/MLP 中间值仍可为 BF16 或 FP32；
 - NVFP4 Qwen 减少权重存储，但 full-precision GEMM 需要反量化权重；
@@ -1215,9 +1777,9 @@ S≈15,399+L 时，attention 的算术复杂度是 O(S²)，但 fused backend �
 
 ## 15. 尚未实测的部分与后续验证方法
 
-### 15.1 当前不能下的结论
+### 15.1 静态分析阶段的未验证边界（第 17 章已补实测）
 
-在没有动态 trace 的情况下，本文刻意不声称：
+在第 1–16 章的静态分析阶段，本文刻意不声称：
 
 - 某次 `F.linear` 对应的具体 cuBLASLt/CUTLASS 模板名；
 - 主 SDPA 最终选了 Flash、cuDNN、mem-efficient 或 math 哪个后端；
@@ -1228,7 +1790,7 @@ S≈15,399+L 时，attention 的算术复杂度是 O(S²)，但 fused backend �
 
 ### 15.2 若必须形成逐 kernel 证据，建议这样做
 
-这部分是**建议，未在本轮执行**：
+以下是静态分析阶段提出的验证建议；第 17 章已经实际执行 Nsight Systems/CUPTI + NVTX，并用 SQLite 保存逐 kernel 证据：
 
 1. 固定相同 prompt、seed、shape、20 steps 和模型文件，先做一次不计时的 warm-up，再分别测冷启动和热执行，避免把首次加载混入稳定 kernel 对比。
 2. 在文本 encode、第一个 denoise step、后续 step、audio decode、video decode 分段使用 `torch.profiler`，开启 CPU/CUDA activities、`record_shapes`、`profile_memory`、必要的 `with_stack`。
@@ -1240,7 +1802,7 @@ S≈15,399+L 时，attention 的算术复杂度是 O(S²)，但 fused backend �
 4. 需要最终 CUDA kernel 名时，用 Nsight Systems/CUPTI 同时采集 CUDA API、GPU kernels 和 memcpy，并把节点 span 与 GPU timeline 对齐；不能只依赖 Comfy Kitchen backend capability 列表。
 5. 输出按“Python op → custom op/C++ binding → CUDA kernel”三级整理，另记 fallback、dtype、shape 和每次调用所在 block，才能将本报告的静态候选转成真实调用栈。
 
-本轮未进行这些 profiling，因为用户要求的是对已经跑通 workflow 的深入源码与既有证据分析，而不是再次承担一次完整 20 步生成及 profiler 的额外开销。
+第 1–16 章撰写时未进行这些 profiling；后续按用户要求已补做完整 20 步 T2V 的 CUPTI 采集。原始 trace、逐 kernel 数据和结论见第 17 章及独立实测报告。
 
 ## 16. 关键源码与证据索引
 
@@ -1281,3 +1843,155 @@ S≈15,399+L 时，attention 的算术复杂度是 O(S²)，但 fused backend �
 | Kitchen INT8 attention | `.venv/lib/python3.12/site-packages/comfy_kitchen/sage_attention.py:208-317,597-636` |
 
 完整的命令、元数据输出、问题与解决过程另见 `run_book.md` 的“T2V 函数与 Kernel 调用栈分析”章节。本文所有“实测”结论均能回指上述本地文件，不以模型名或经验推断替代证据。
+
+
+## 17. CUPTI 逐 Kernel 实测（后续补充）
+
+### 17.1 实测对象与采集方法
+
+后续按用户要求，使用相同 API prompt 在独立 8189 实例完成了真实 Nsight Systems/CUPTI 采集，原 8188 服务未停止或修改。
+
+- prompt ID：`24fe3352-d0a1-4dd7-ac4a-4b1b46b1f09f`；
+- Nsight Systems 2024.6.2，`--trace=cuda,nvtx`、`--capture-range=cudaProfilerApi`、`--cuda-graph-trace=node`；
+- `cudaProfilerStart` 在 prompt 提交前调用，`cudaProfilerStop` 在完成后调用；
+- 包含模型首次执行和首次 kernel 初始化，不包含 ComfyUI 启动初始化；
+- `run_result.success=true`，输出 MP4 经 PyAV 验证为 864×480、24 fps、124 帧、32 kHz 双声道 AAC。
+
+原始文件：
+
+- `logs/cupti_h3_t2v/h3_t2v_cold.nsys-rep`：12,178,305 bytes；
+- `logs/cupti_h3_t2v/h3_t2v_cold.sqlite`：26,533,888 bytes。
+
+总量为 **95,226 个 kernel、155 种 kernel、67 个 NVTX 区间、5,596 次 memcpy（46,506,971,601 bytes）、421,188 条 runtime API**。
+
+`analyze_h3_cupti.py` 用 runtime correlationId 将 kernel 归入最小 H3 NVTX 子区间，避免异步执行错分。完整数据见 `logs/cupti_h3_t2v/analysis/`，详细解释见 [CUPTI 逐 Kernel 实测报告](./cupti_h3_t2v_kernel_report.md)。
+
+### 17.2 各阶段实测概览
+
+下表的 GPU work 是 kernel duration 之和，不是 wall time；不同 stream 可能重叠。NVTX duration 是 host 区间，包含初始化、同步、offload、Python 和异步等待。
+
+| 阶段 | host range | kernel 数 | GPU work | memcpy |
+|---|---:|---:|---:|---:|
+| Qwen | 113.043 s | 2,366 | 444.075 ms | 15.237 GB |
+| text refiner | 14.275 s | 32 | 0.831 ms | 1.596 GB |
+| DiT step.01 | 178.617 s | 2,990 | 1,708.844 ms | 19.626 GB |
+| DiT step.02..20（每一步） | 约 1.16 s | 各 2,986 | 约 1,700.5 ms | 各 175.701 MB |
+| audio VAE decode | 3.050 s | 2,679 | 34.288 ms | 259.412 MB |
+| video VAE decode | 25.427 s | 1,979（ViT 外） | 10.228 ms | 617.103 MB |
+| video ViT.01 | 22.379 s | 792 | 80.697 ms | 4.869 GB |
+| video ViT.02..42（每次） | 约 35–63 ms | 各 648 | 约 22–78 ms | 常规各 16 KiB |
+
+`res_multistep` 整个父区间为 211.329 s；扣除 DiT 子区间后，scheduler 还有 1,067 个小 kernel，合计约 2.742 ms，证明采样器是普通 tensor op 的组合，不是单个专用 kernel。
+
+### 17.3 Qwen：实测 NVFP4 反量化后是 FP32 计算
+
+实际 trace 为：
+
+```text
+350 × dequantize_nvfp4_kernel<..., float, ...>
+  → 350 × cutlass3x_sm100_simt_sgemm_f32
+  → 50 × fmha_cutlassF_f32_aligned_64x128_rf_sm80
+```
+
+- 350 次反量化合计 26.807 ms，平均 76.593 µs；
+- 350 次 FP32 GEMM 对应 50 层×7 个 q/k/v/o、gate/up/down Linear；
+- 50 次 FP32 mem-efficient attention 合计 10.115 ms，平均 202.295 µs；
+- 200 个 FP32 layer_norm，对应每层 input/post-attention/Q/K norm。
+
+按 grid 和源码 shape 映射：
+
+| Linear | 次数 | GEMM 与 grid |
+|---|---:|---|
+| q_proj | 50 | FP32 64×32，(128,13) |
+| k_proj / v_proj | 100 | FP32 64×32，(16,13) |
+| o_proj | 50 | FP32 128×64，(40,7) |
+| gate_proj / up_proj | 100 | FP32 128×64，(200,7) |
+| down_proj | 50 | FP32 128×64，(40,7) |
+
+o/down 的 output shape 相同，不能只凭 grid 区分每个实例，但每类次数和源码顺序与 50×7 完全吻合。
+
+**全部 155 种 kernel 中没有 `scaled_mm_nvfp4` 或 `cublas_gemm_blockwise_fp4`。** 因而本流程的 NVFP4 是权重存储压缩，实际文本计算是 FP32，而不是 FP4 Tensor Core 计算。
+
+### 17.4 主 DiT：实测 BF16 FlashAttention 与 4000 次 INT8 Linear
+
+activation quant 的 grid M=15,787，结合 video 14,985 + audio 414 行，得到本次 text_len=388，因此实际 packed S=15,787。
+
+主 attention：
+
+```text
+pytorch_flash::flash_fwd_kernel<..., cutlass::bfloat16_t,...>
+```
+
+- 主 DiT 共 1000 次，合计 17.660879 s，平均 17.660879 ms；
+- text refiner 另有 2 次，合计约 0.061 ms；
+- 全局该 kernel 共 1002 次。
+
+主 INT8 Linear 共 **4000 = 20×50×4** 次：
+
+| 层类型 | 次数 | 实测 kernel 路径 | 总时间 |
+|---|---:|---|---:|
+| qkv_proj + fc1 | 2,000 | identity swizzle，BF16-output CUTLASS | 8.776803 s |
+| out_proj + fc2 | 2,000 | LeanStreamKT，BF16-output CUTLASS | 3.630500 s |
+
+同一 DiT 阶段还另有 20 个 `cutlass_80_simt_sgemm`，每步一个非 INT8 的单精度 GEMM。因此全部 `cutlass::Kernel2` 为 4020 个，只有其中 4000 个是 `signed char` INT8 GEMM；额外的 20 个不计入 INT8 数量。
+
+在线 ConvRot 也恰为 4000 次：
+
+- qkv/fc1 K=5,376：2,000 个 block_threads=256/code0，合计 498.528 ms；
+- out K=7,168：1,000 个 block_threads=512/code0，合计 337.920 ms；
+- fc2 K=14,336/SwiGLU：1,000 个 block_threads=1024/code2，合计 911.173 ms。
+
+另有 1000 个 BF16 `rope_kernel`（fused RMSNorm+RoPE），合计 720.691 ms；6000 个分段 `addcmul`，合计 452.751 ms。
+
+按 20 步总 kernel work 34.030 s 计算，FlashAttention 约占 51.9%，INT8 GEMM 约占 36.5%，ConvRot 约占 5.1%，RoPE 约占 2.1%，其他约占 4.4%。这是 work 占比，不是 wall-time 占比。
+
+### 17.5 两个 VAE 的真实 kernel
+
+Video VAE 实际有 42 次 ViT forward：
+
+```text
+7 temporal chunks × 3 高度 tile rows × (4+1) 宽度 batch = 42
+```
+
+每次 36 层，所以 `to_qkv/to_out/ff.w1/ff.w2` 各 1512 次，共 **6048 次 INT8 GEMM**。
+
+其中：
+
+- 3024 个 CUTLASS 带 `VisitorAuxLoad`，实际执行 `to_out/ff.w2` residual epilogue；
+- 3024 个不带 `VisitorAuxLoad`，对应 `to_qkv/ff.w1`；
+- 1512 个 `qk_int_sv_i8_attn_kernel`，合计 284.758 ms；
+- `quant_qk_fused`、`quant_v_int8_kernel`、FP16 `rope_kernel` 各 1512 次；
+- 在线 ConvRot 也为 6048 次，与四类 Linear 对应。
+
+第一次 ViT 为 792 kernels，后续常规为 648，首次额外初始化使二者必须分开分析。
+
+Audio VAE 实测为 FP32 Conv1d/ConvTranspose1d、Snake、replication pad 和逐点 op，没有 INT8/NVFP4 kernel。名称含 `dgrad` 的 cuDNN kernel 服务于 BigVGAN 的转置卷积前向，不表示训练 backward。
+
+全部 95,226 个 kernel 的 `graphNodeId` 均为空，未观察到 CUDA Graph node kernel，不能把 allocation graph 解释为整个 H3 的 CUDA Graph replay。
+
+### 17.6 runtime API 与冷启动的解释边界
+
+完整 runtime API 统计中，host total 较高的项目为：
+
+- `cudaMemsetAsync`：4,293 次，13.764 s；
+- `cudaStreamSynchronize`：1,038 次，10.573 s；
+- `cudaHostRegister`：852 次，8.194 s；
+- `cudaLaunchKernel`：93,597 次，6.718 s；
+- `cuMemCreate`：1,153 次，3.140 s；
+- `cuMemSetAccess`：1,153 次，1.453 s；
+- `cudaMemcpyAsync`：4,275 次，1.077 s；
+- `cudaMallocAsync`：99,972 次，0.692 s。
+
+这些 host API 时间也不能直接相加为 wall time。Qwen 的 `cudaHostRegister` 为 2.979 s，DiT 首步为 4.034 s，但 Qwen host range 为 113 s、首步为 178.6 s。磁盘/mmap page fault、Python、模型结构处理、部分权重准备和 host 等待不在 CUPTI kernel trace 中，不能把冷启动全部归因于 GPU kernel 或 memcpy。
+
+### 17.7 原始 trace 与复核入口
+
+- 原始数据：`logs/cupti_h3_t2v/h3_t2v_cold.nsys-rep`、`h3_t2v_cold.sqlite`；
+- 逐 kernel 原始记录：`logs/cupti_h3_t2v/analysis/kernel_events.csv.gz`；
+- 全局统计：`global_kernel_summary.csv`；
+- 分阶段统计：`phase_kernel_summary.csv`；
+- 每步 DiT/每次 ViT：`range_kernel_summary.csv`、`range_summary.csv`；
+- 所有 runtime API：`runtime_api_summary.csv`；
+- Nsight 交叉核验：`nvtx_kern_sum.txt`；
+- 独立实测说明：[cupti_h3_t2v_kernel_report.md](./cupti_h3_t2v_kernel_report.md)；
+- 全部命令、问题和解决过程：`run_book.md` 的“CUPTI 逐 Kernel 实测”章节。
