@@ -3093,3 +3093,1294 @@ cd /home/kaokaolv/comfyui_h3
 - 现有 MXFP8 与 MXFP4 不能混同：MXFP8 是 FP8 E4M3 + 32 元素 E8M0 block scale；MXFP4 是 FP4 E2M1 + 32 元素 E8M0 block scale；NVFP4 是 FP4 E2M1 + 16 元素 E4M3 block scale + tensor scale。需要分别实现 layout、quant/dequant、GEMM 和 loader 映射。
 
 开始核对本机 comfy-kitchen、vLLM 和 vllm-omni 源码，随后补官方来源并写 proposal。
+
+
+### 51.1 用户补充确认：H3 是否都是 dense
+
+用户追问当前 workflow 中的模型是否都是 dense。复核 `video_minimax_h3_t2v.json`、既有 CUPTI 结果和 `ComfyUI/comfy/ldm/minimax/model.py` 后确认：本方案关注的 Linear 全是稠密 Linear，没有 MoE 路由专家；但整个网络并非只有 Linear，还含 BF16 FlashAttention、Sage INT8 attention、RMSNorm、RoPE、卷积等。
+
+- 主 DiT：50 blocks × `qkv_proj/out_proj/fc1/fc2`，200 个目标 Linear。
+- Qwen 文本编码器：50 层 × 7 个 Linear，350 个目标 Linear。
+- 视频 VAE ViT：36 层 × 4 个 Linear，144 个目标 Linear。
+- 音频 VAE：FP32 Conv1d/ConvTranspose1d 为主，不改造。
+- `model.py:178` 的可选 `to_gate_compress` 是稀疏 attention 扩展门控，不是 MoE expert 路由；当前 dense forward 不使用它，不能因此误称 MoE。
+- proposal 不包含 MoE、专家并行和通用 sparse Linear。文本编码器文件中的非本次 T2V 使用模块也不能未经 manifest 检查就全部量化。
+
+### 51.2 vLLM dense kernel 选择和真实权重格式
+
+本机参考环境：`/home/kaokaolv/.venv-vllmomni029`，vLLM 0.29.0。读取：
+
+```text
+vllm/model_executor/kernels/linear/__init__.py
+  _POSSIBLE_MXFP8_KERNELS:509-529
+  _POSSIBLE_MXFP4_KERNELS:559-574
+  init_mxfp8_linear_kernel:845-880
+  init_mxfp4_linear_kernel:883-922
+  mxfp8/Mxfp8LinearKernel.py
+  mxfp8/flashinfer.py
+  mxfp8/marlin.py
+  mxfp4/base.py
+  mxfp4/flashinfer.py
+  mxfp4/marlin.py
+  layers/quantization/online/mxfp8.py
+  layers/quantization/online/mxfp4.py
+  layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_mxfp8.py
+  layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxfp4.py
+```
+
+结论：
+
+1. vLLM 按平台列出候选，依次做 `is_supported()` 和 `can_implement(config)`，支持 backend 过滤、禁用列表和失败原因汇总。该策略适合借鉴，不应只按 GPU 名称写一条 if/else。
+2. MXFP8 的 FlashInfer CUTLASS/CuTe-DSL 都是 W8A8；Marlin 是 W8A16，不应被当作 W8A8 的静默替代。
+3. MXFP4 的 FlashInfer CuTe-DSL 是真 W4A4，权重 `[N,K/2]` uint8、E8M0 group-32 scale、无 global scale，activation 动态量化；Marlin 是 W4A16。
+4. compressed-tensors MXFP8 键为 `weight/weight_scale`，MXFP4 为 `weight_packed/weight_scale`。vLLM 加载后统一成 `layer.weight/layer.weight_scale`，再 `process_weights_after_loading()` 做 scale swizzle 和必要的权重准备。
+5. BF16 online quantization 和 compressed-tensors 预量化加载最后进入同一个 kernel，说明 ComfyUI 也应共用运行时格式，而不是复制两套 Linear。
+
+### 51.3 FlashInfer 接口与依赖边界
+
+读取本机包：
+
+```text
+flashinfer/gemm/gemm_base.py
+  mm_mxfp8:5579-5747
+  _cudnn_mm_mxfp8_requirement:5042-5059
+  _cute_dsl_gemm_fp4_requirement:6177-6204
+  mm_fp4:7080-7234
+flashinfer/quantization/fp4_quantization.py
+  mxfp4_quantize:1546-1624
+  mxfp4_dequantize:1628-1660
+```
+
+官方 API 页面也已读取：
+
+- https://docs.flashinfer.ai/generated/flashinfer.gemm.mm_mxfp8.html
+- https://docs.flashinfer.ai/generated/flashinfer.gemm.mm_fp4.html
+
+确认：
+
+- `mm_mxfp8(a, b, a_descale, b_descale, ..., backend=...)` 中 A 是 `[M,K]`，B 是 `[K,N]` 的 column-major 视图；权重可保留 `[N,K]`，调用时 `.t()`，B scale 仍按 `[N,K/32]` 的 128x4 swizzle 语义准备，不把 scale 简单数值转置。
+- `mm_fp4(..., block_size=32, use_nvfp4=False, alpha=None)` 才是 MXFP4；packed data 的最后一维是 K/2。默认参数 `block_size=16,use_nvfp4=True` 是 NVFP4，绝不能复用默认值。
+- MXFP8 官方接口要求 1D 128x4 scale；当前 Comfy-Kitchen 同物理布局可以 reshape 成 1D view，无需重新量化。
+- CuTe-DSL FP4 在本机源码中要求 128x4 scale、N%8==0，以及对应 device capability；输出是 FP16/BF16，不支持直接 FP32 输出。
+- MXFP4 quantizer 提供稳定 `backend="cuda"` 和实验性 `backend="cute-dsl"`，实现选择必须单独测试，不能因为 GEMM backend 名称相同就假定量化字节也完全一致。
+- FlashInfer 的 kernel 由 FlashInfer/CUTLASS/CuTe 提供。推荐 Comfy-Kitchen 做 adapter 和选择，不复制底层 kernel 源码，也不把新 kernel 错称为 comfy-kitchen `_C` 原生实现。
+- ComfyUI 当前虚拟环境探测结果 `comfy_venv_flashinfer_spec: None`，因此 FlashInfer 尚未在 ComfyUI 环境可用。另一环境存在 Python 包不等于当前 8188 服务能调用，不能通过 PYTHONPATH 混用两个 PyTorch 环境。
+
+### 51.4 ComfyUI 加载、dtype 和融合边界
+
+读取本机 ComfyUI（commit `989d93d0d968e704c589ce0146bb18c77f6b50cc`）：
+
+```text
+comfy/quant_ops.py:72-147,201-257
+  已有 TensorCoreMXFP8Layout 子类和 mxfp8 QUANT_ALGOS，没有 mxfp4。
+comfy/ops.py:1342-1485
+  _load_quantized_module 读取 .comfy_quant、weight 和 scale。
+comfy/ops.py:1542-1670
+  mixed_precision_ops、activation 动态量化、weight-only 分支。
+comfy/utils.py:1467-1532
+  detect_layer_quantization 和 convert_old_quants 的既有入口。
+comfy/sd1_clip.py:109-120
+  文本编码器使用 full_precision_mm=True 构造 mixed_precision_ops。
+comfy/ldm/minimax/vae.py:289-375
+  RMSNorm、SwiGLU、residual 的 linear_input_act 调用。
+comfy/ldm/minimax/model.py:167-218
+  主 DiT dense qkv/out/fc1/fc2，fc2 前有 SwiGLU。
+```
+
+设计决策：
+
+1. 新 MXFP 文件必须显式写 `full_precision_matrix_mult=false`，在 `_load_quantized_module` 中只对 MXFP8/MXFP4 让“文件显式设置”覆盖父级默认，未写该字段的文件继续继承父级默认。其他格式维持原有分支。这样不必全局修改 `sd1_clip.py`，也不会意外把现有 NVFP4 文本编码器切换到真 GEMM。
+2. 第一版 MX layout 不实现 INT8 ConvRot 的融合语义；`linear_input_act` 对可选融合返回 `NotImplemented`，由现有 `ComfyUI/comfy/ops.py` 在模块层先执行 RMSNorm/SwiGLU，再调用 MX GEMM，最后执行 residual，保持数学顺序。
+3. FlashInfer 只输出 FP16/BF16。当前 Qwen 实测为 FP32 GEMM，因此 proposal 必须定义 MX 层的 BF16 输出/后续 FP32 residual 策略和精度验证，不能宣称 dtype 完全不变。
+4. VAE 保留现有 Sage INT8 attention；主 DiT BF16 FlashAttention 和音频 FP32 Conv 不改。
+5. 原生 `.comfy_quant` 单文件是首要交付格式；不要求 ComfyUI 运行时导入 vLLM 或 compressed-tensors。标准 compressed-tensors 的目录 `config.json` 不会自动被当前单文件 loader 发现，需要离线转换时显式提供 recipe，不能把缺失 recipe 当作未量化 BF16。
+
+### 51.5 源码量化细节和静态 shape/存储测算
+
+已核实：Comfy-Kitchen eager MXFP8 以每 32 个元素为一组，E8M0 exponent 使用 `ceil(log2(amax/448))`，再转 E4M3；vLLM 的 MXFP8 源码也采用向上取 exponent 的算法。vLLM MXFP4 Triton 则按 OCP 规则先将 block amax 做 round-to-nearest-even，再 `floor(log2(amax))-2` 得 scale exponent，E2M1 为 RNE、低 nibble 存偶数元素、高 nibble 存奇数元素。不同 FP4 quantizer 的 scale/舍入规则必须记录并逐字节验证，不能把“都是 MXFP4”当成 bitwise 相同。
+
+读取的额外源码：
+
+```text
+comfy_kitchen/backends/eager/quantization.py:280-406,607-718
+comfy_kitchen/float_utils.py:292-382
+vllm/model_executor/layers/quantization/utils/mxfp8_utils.py:14-85,181-237
+vllm/model_executor/layers/quantization/utils/mxfp4_utils.py:188-277,470-496
+```
+
+静态 shape 测算实际执行命令：
+
+```bash
+python3 - <<'PY'
+# 用已实测的 50×4 DiT、50×7 Qwen、36×4 Video-VAE-ViT 形状，
+# 输出每类层的 N/K、是否均被 128 整除、Linear 数量、总元素，
+# 以及 BF16/MXFP8(8.25bit)/MXFP4(4.25bit) 的 payload GiB。
+PY
+```
+
+结果：全部目标 Linear 的 K、N 都能被 128 整除；总数分别 200、350、144。只计这些 Linear 的 qdata+未对齐线性 scale 的理论 payload（不含其他权重、框架和激活）：
+
+```text
+DiT:          19,267,584,000 elements; BF16 35.889 GiB; MXFP8 18.505 GiB; MXFP4 9.533 GiB
+Qwen:         24,379,392,000 elements; BF16 45.410 GiB; MXFP8 23.415 GiB; MXFP4 12.062 GiB
+Video VAE ViT: 2,415,919,104 elements; BF16  4.500 GiB; MXFP8  2.320 GiB; MXFP4 1.195 GiB
+```
+
+上述不是完整 checkpoint 大小，也不是实测 VRAM。实际显存仍需通过 CUPTI 和显存探针测量。
+
+### 51.6 查询中遇到的问题及修正
+
+1. 初次按旧布局猜 `mxfp8/flashinfer_cutedsl.py`、`mxfp4/MxFp4LinearKernel.py`，文件不存在；Glob 后确认真实文件是 `mxfp8/flashinfer.py`、`mxfp4/base.py`。没有继续猜接口，改读实际源码。
+2. 初次猜 `flashinfer/quantization/mxfp4_quantize.py`，文件不存在；真实公开入口在 `fp4_quantization.py:1546`，CuTe 实现在其 `quantization/kernels/` 下。
+3. 一个读取 Comfy-Kitchen eager 文件的路径漏写 `comfyui_h3`，返回 file-not-found；已使用本任务环境 `.venv` 的正确路径重新读取，没有更换环境。
+4. 两次宽泛 Glob/Grep 超时或输出过大；改为固定子目录、精确类名/函数名和限定行段。未依赖超时结果作结论。
+5. `pip show` 与 git 查询的命令转入后台，207.683s 后正常结束；确认 comfy-kitchen 0.2.41、vLLM 0.29.0 和 ComfyUI commit。没有把等待时间误写成 kernel 或模型运行时间。
+6. 早期摘要中 MXFP4 的 Triton/FlashInfer 文件名不是最终调用入口；proposal 区分 vLLM 权重量化、FlashInfer activation 量化与 FlashInfer GEMM 三部分，避免混为一谈。
+7. 查询期间读取了 `/home/kaokaolv/AGENTS.md` 和 `ComfyUI/AGENTS.md`；后者要求保持最小改动、复用原生 loader、失败明确而非静默降质。方案据此采用单文件、明确 metadata 校验、显式 fallback policy，不增加 H3 专用节点。
+
+本轮没有启动/停止 8188 服务，没有安装依赖、修改模型、转换权重或运行新的 GPU 推理。proposal 中的 API 和阶段测试均为待实施设计，不能视为已跑通结果。
+
+
+### 51.7 Proposal 初稿与 kernel 内部实现补证
+
+已新建 `comfyui_h3_mxfp8_mxfp4_proposal.md`，内容包括：真实 H3 目标层、MX 数学格式、公共接口、原生文件格式、两层 backend dispatch、FlashInfer adapter、ComfyUI loader、compressed-tensors 无损映射、分阶段实施和 CUPTI/质量/显存验收。该文件是设计稿，没有修改 ComfyUI/comfy-kitchen 源码。
+
+为把“kernel 实现”写清楚，进一步读取：
+
+```text
+flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100.py:50-180,193-371,467-573,1127-1144
+flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_common.py:84-220
+```
+
+确认 B200 CuTe 实现直接接收 A/B/SFA/SFB，先构建 block-scaled tiled MMA 和 TMA descriptor，使用 warp specialization、`PipelineTmaUmma`、`PipelineUmmaAsync`、tensor-memory FP32 accumulator，SFA/SFB 设置后调用 `cute.gemm`，最后 epilogue 输出。MMA instruction K=256 bit（FP8 32 个元素、FP4 64 个元素），tile K 包含 4 个 instruction K step；scale group 仍为 32 元素，两者不是同一概念。底层类有 FP32 accumulator，但公开 FlashInfer wrapper 仍限 FP16/BF16 输出，proposal 已明确这一边界。
+
+### 51.8 128x4 scale 的纯 CPU 实测
+
+为避免只凭“128x4”名称假定 Comfy-Kitchen 和 vLLM 布局相同，执行：
+
+```bash
+/home/kaokaolv/comfyui_h3/.venv/bin/python - <<'PY'
+import torch
+from comfy_kitchen.float_utils import to_blocked, from_blocked
+r, g = 128, 8
+s = torch.arange(r * g, dtype=torch.uint8).reshape(r, g)
+ck = to_blocked(s).contiguous()
+vllm = s.view(1, 4, 32, 2, 4).transpose(1, 3).contiguous().view(-1)
+print('byte_equal:', torch.equal(ck, vllm))
+print('comfy_inverse_exact:', torch.equal(from_blocked(ck, r, g), s))
+print('num_mismatches:', int((ck != vllm).sum()))
+PY
+```
+
+命令进入后台，157.579s 后正常结束。实际输出：
+
+```text
+byte_equal: True
+comfy_inverse_exact: True
+num_mismatches: 0
+```
+
+两套 Python scale 重排在这个 `[128,8]` 样例上逐字节相同，逆变换正确。该结论仅覆盖 CPU 索引变换，未声称 CUDA `quantize_mxfp8` 或 FlashInfer GEMM 已验证；这些仍列入 P0。
+
+### 51.9 文档验证脚本的问题与修正
+
+第一次执行 Markdown 结构检查：
+
+```bash
+python3 - <<'PY'
+# 检查 code fence、第1至18节标题、必要术语和本地证据路径。
+PY
+```
+
+首次在章节1处触发 `AssertionError: 1`。原因是检查脚本把 raw regex 写成了 `rf'^## {heading}\\.'`，匹配了多余的反斜杠，而不是文档缺少第1节。应改成 `rf'^## {heading}\.'`，不修改文档来迎合错误的测试。后续重新运行修正后的检查并记录结果。
+
+
+### 51.10 eager 语义、兼容性和最终一致性修正
+
+继续读取 `comfy_kitchen/scaled_mm_v2.py:101-126`，发现 eager MXFP8 在 PyTorch 有能力时调用 `torch.nn.functional.scaled_mm`，并非必然是 dequantize+普通 GEMM。已修正 proposal：
+
+- 将现有 `torch_scaled_mm_v2` 单独列为 P0/CUPTI 待验证候选，不称为 fake，也不未经实测宣称可用。
+- 只有明确写出来的 dequantize+FP32 计算才叫 `eager_reference`。
+- fast path 不能因 CUDA backend 失败自动落到未验证的 eager；显式 reference 由 layout 直接 dequantize，不借用普通 registry fallback 冒充 fast path。
+- full-precision 覆盖规则只对 MXFP8/MXFP4 生效；其他量化格式保留原分支，避免意外改变旧模型。
+- `disabled_formats` 的禁止 fast path 优先级最高。
+
+MXFP4 scale 的来源也已补查 `vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py:964-1005`。其 `swizzle_mxfp4_scales` 明确使用 `[numMTiles,numKTiles,32,4,4]`，输入 `[N,K//32]`，与 MXFP8 的 32 元素分组及 128x4 重排规则一致；这里只借用 dense 的 scale 工具，不引入 MoE 实现。
+
+### 51.11 已执行 Bash 命令的完整记录
+
+环境版本和仓库状态查询（后台正常完成）：
+
+```bash
+git -C /home/kaokaolv/comfyui_h3/ComfyUI rev-parse HEAD && \
+git -C /home/kaokaolv/comfyui_h3/ComfyUI status --short && \
+/home/kaokaolv/comfyui_h3/.venv/bin/python -m pip show comfy-kitchen && \
+/home/kaokaolv/.venv-vllmomni029/bin/python -m pip show vllm
+```
+
+输出：ComfyUI `989d93d0d968e704c589ce0146bb18c77f6b50cc`，`git status --short` 无输出，comfy-kitchen 0.2.41，vLLM 0.29.0。
+
+当前 ComfyUI 环境的 FlashInfer 探测：
+
+```bash
+/home/kaokaolv/comfyui_h3/.venv/bin/python - <<'PY'
+import importlib.util
+print('comfy_venv_flashinfer_spec:', importlib.util.find_spec('flashinfer'))
+PY
+```
+
+输出 `comfy_venv_flashinfer_spec: None`。
+
+H3 shape 和理论 payload 测算的完整代码：
+
+```bash
+python3 - <<'PY'
+from math import ceil
+shapes = {
+    'DiT': (50, [('qkv_proj', 5376, 21504), ('out_proj', 7168, 5376), ('fc1', 5376, 28672), ('fc2', 14336, 5376)]),
+    'Qwen': (50, [('q_proj', 5120, 8192), ('k_proj', 5120, 1024), ('v_proj', 5120, 1024), ('o_proj', 8192, 5120), ('gate_proj', 5120, 25600), ('up_proj', 5120, 25600), ('down_proj', 25600, 5120)]),
+    'Video_VAE_ViT': (36, [('to_qkv', 2048, 6144), ('to_out', 2048, 2048), ('ff.w1', 2048, 16384), ('ff.w2', 8192, 2048)]),
+}
+for name, (layers, specs) in shapes.items():
+    print(name, 'all_K_divisible_by_128=', all(k % 128 == 0 for _, k, n in specs), 'all_N_divisible_by_128=', all(n % 128 == 0 for _, k, n in specs))
+    print('count=', layers * len(specs))
+    total = 0
+    for layer, k, n in specs:
+        elements = layers * n * k
+        total += elements
+        print(f'  {layer}: N={n} K={k} layers={layers} elements={elements:,}')
+    print(f'  total_elements={total:,} bf16_GiB={total * 2 / 2**30:.3f} mxfp8_payload_GiB={total * 33 / 32 / 2**30:.3f} mxfp4_payload_GiB={total * 17 / 32 / 2**30:.3f}')
+PY
+```
+
+128x4 scale 的完整 CPU 验证代码：
+
+```bash
+/home/kaokaolv/comfyui_h3/.venv/bin/python - <<'PY'
+import torch
+from comfy_kitchen.float_utils import to_blocked, from_blocked
+r, g = 128, 8
+s = torch.arange(r * g, dtype=torch.uint8).reshape(r, g)
+ck = to_blocked(s).contiguous()
+num_m_tiles = (r + 127) // 128
+num_k_tiles = (g + 3) // 4
+vllm = s.view(num_m_tiles, 4, 32, num_k_tiles, 4).transpose(1, 3).contiguous().view(-1)
+print('shape:', tuple(s.shape))
+print('byte_equal:', torch.equal(ck, vllm))
+print('comfy_first_32:', ck[:32].tolist())
+print('vllm_first_32: ', vllm[:32].tolist())
+print('comfy_inverse_exact:', torch.equal(from_blocked(ck, r, g), s))
+print('num_mismatches:', int((ck != vllm).sum()))
+PY
+```
+
+结果见 51.8：两者 byte 完全相同，逆变换相同，0 个 mismatch。这是 CPU 元数据/layout 测试，不是 GPU 模型推理。
+
+最终 Markdown 和本地证据检查（已修正 51.9 所述测试正则）：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/home/kaokaolv/comfyui_h3/comfyui_h3_mxfp8_mxfp4_proposal.md')
+s = p.read_text()
+assert s.count('```') % 2 == 0, 'unpaired code fence'
+for heading in range(1, 19):
+    assert re.search(rf'^## {heading}\.', s, re.M), heading
+for text in ['尚未实现', 'scaled_mm_mxfp8', 'scaled_mm_mxfp4', 'full_precision_matrix_mult', 'compressed-tensors', 'FlashInfer', 'CUPTI', 'dense', '128x4', 'tcgen05', 'torch_scaled_mm_v2']:
+    assert text in s, text
+for rel in ['video_minimax_h3_t2v.json', 'logs/model_card_runs/video_minimax_h3_t2v/api_prompt.json', 'comfyui_h3_t2v_kernel_analysis.md', 'logs/cupti_h3_t2v/h3_t2v_cold.sqlite']:
+    assert (p.parent / rel).exists(), rel
+for link in re.findall(r'\]\((\./[^)]+)\)', s):
+    assert (p.parent / link).exists(), link
+print('proposal_structure_and_local_evidence_ok')
+print('lines:', len(s.splitlines()), 'bytes:', len(s.encode()))
+print('code_fences:', s.count('```'))
+PY
+
+git -C /home/kaokaolv/comfyui_h3/ComfyUI status --short
+git -C /home/kaokaolv/comfyui_h3/ComfyUI diff --check
+```
+
+最终实际输出：
+
+```text
+proposal_structure_and_local_evidence_ok
+lines: 890 bytes: 46719
+code_fences: 42
+```
+
+`git status --short` 和 `git diff --check` 均无输出。没有修改 ComfyUI tracked 文件，没有安装依赖、下载/转换模型、启动新服务、停止原 8188 服务或执行新的 GPU 推理。
+
+最终交付：[`comfyui_h3_mxfp8_mxfp4_proposal.md`](./comfyui_h3_mxfp8_mxfp4_proposal.md)。详细调研、问题与修正均记录在第 51 节；待用户审阅 proposal 后，才进入 P0 实现前验证。
+
+---
+
+## 52. Comfy-Org MiniMax-H3 五个模型文件的结构/精度/参数量分析
+
+### 52.1 任务
+
+用户要求分析 [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) 中 5 个文件（DiT int8_convrot、TE nvfp4_awq、video VAE int8_convrot、audio VAE fp32、8-step turbo LoRA）的模型结构、文件大小、各模块精度与参数量占比，要求同时核对 model card、config 与 safetensors 实际内容，输出到一个 markdown 文档。
+
+### 52.2 方法
+
+1. 拉取 HF model card（`README.md`）、HF API 的仓库文件清单与 LFS oid、上游 `MiniMaxAI/MiniMax-H3` 的 `FL2VA/{transformer,text_encoder,video_vae,audio_vae}/config.json`。
+2. 写 `analyze_h3_safetensors.py`：只读 safetensors header（8B 长度 + JSON）与 `comfy_quant` blob，不加载权重；按"逻辑参数量"统计（NVFP4 U8 权重 ×2，int8 ×1），量化 side-car 不计入参数。
+3. 读取上游 13 个 transformer shard 的 header（HTTP Range，每次只取前 ~6KB）用于 full vs pruned 对比。
+4. 对照 ComfyUI 源码 `comfy/ldm/minimax/{model,vae,audio_vae}.py`、`comfy/model_detection.py`、`comfy/quant_ops.py`、`comfy/ops.py`、`comfy_kitchen/tensor/int8.py` 确认加载/计算路径。
+5. 抽样读取张量验证数值（INT8 值域、per-channel scale、NVFP4 三层 scale、LoRA alpha）。
+
+关键命令：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+.venv/bin/python analyze_h3_safetensors.py
+python3 - <<'PY'   # 读取 13 个上游 shard header 求和
+...urllib Range 请求...
+PY
+# 抽样验证
+.venv/bin/python - <<'PY'
+from safetensors import safe_open
+...读取 blocks.0.* / model.layers.0.* / decoder.* / lora_* ...
+PY
+```
+
+### 52.3 关键结论
+
+- DiT：932 tensor，20.111 B 参数，20.970 GB；int8 占 95.80% 参数（19.268 B），bf16 3.97%，fp16 0.22%，fp32 0.01%。200 个 int8 层 = 50 block × 4 线性层；token_refiner、condition_proj、norm 为 bf16；AdaLN 为 fp16；patch/final head 为 fp32。
+- **"pruned" = AdaLN 曲线低秩化**：上游 full 的 `adaln_proj [96768,2688]` + `time_embedder` → `[96768,8]` + `adaln_t_table [1025,8]`。上游 full 33.123 B / 66.28 GB，pruned 20.111 B / 40.23 GB，差 13.01 B 与 26.05 GB 对得上；50 层一层未删。
+- TE：2054 tensor，25.753 B 参数，15.687 GB；50 层 Qwen3-VL（截断，无 final norm/lm_head）+ 27 层 ViT；350 个线性层 nvfp4（4.5 bit/参数，含 FP8 block scale），embedding int8 per-row，ViT bf16。`full_precision_matrix_mult=true` → 反量化 BF16 计算，无需 Blackwell。
+- Video VAE：850 tensor，2.604 B 参数，2.811 GB；decoder 36 层 ViT 的 144 个线性层 int8（2.416 B），encoder 全部 fp16（0.180 B），bias/norm/proj fp32。
+- Audio VAE：917 tensor，151.29 M 参数，0.605 GB，全 fp32；encoder 48.72%、decoder 42.86%、pre_block 8.37%。
+- LoRA：624 tensor，978.06 M 参数，1.956 GB，全 bf16；rank 128（qkv 融合 384）、alpha 8（qkv 24），52 block × 4 模块；占 DiT 参数 4.86%。
+- 文件完整性：`setup_comfyui_h3.sh` 在 revision `4b53a35…` 下载时已按 HF LFS 清单 `sha256sum --check`，`logs/setup_comfyui_h3.log` 全部 OK；本次复核文件大小与 HF API 一致。
+
+### 52.4 交付与验证
+
+- 新增分析脚本：`analyze_h3_safetensors.py`
+- 新增分析文档：`minimax_h3_comfyorg_files_analysis.md`（初版 536 行；追加 §10 证据来源后 714 行 / 40,590 字节）
+- 文档结构自检：所有 §8.2 oid 与 `setup_comfyui_h3.sh` 清单一致；参数总量与 `analyze_h3_safetensors.py` 输出一致（DiT 20,111,438,744；TE 25,753,095,920；video VAE 2,603,871,080；audio VAE 151,287,320；LoRA 978,059,264）。
+- 未修改 ComfyUI tracked 文件，未启动/停止服务，未跑 GPU 推理。
+
+### 52.5 备注
+
+- 分析期间曾启动 5 个文件的全量 sha256（41 GB），因磁盘 I/O 过慢（`sha256sum` 长期 D 状态）中止；改用 setup 日志里的下载时校验记录，并复核了文件大小。临时输出 `.tmp/local_sha256.txt` 已删除。
+- 下载的 config 缓存在 `.tmp/h3cfg/`，供文档引用。
+
+### 52.6 用户追问：结论来源
+
+用户追问“几个值得注意的结论”的依据。已把每条结论拆成三类证据（实测 / 文档 / 推断）并追加为分析文档 §10：
+
+- §10.1 `pruned` 证据链：本地 header、上游 13 shard header、参数量/文件大小对账、`model.py:525` 注释与 `model_detection.py:421-425`；
+- §10.2 `int8_convrot` = W8A8：`comfy_quant` blob、`quant_ops.py:238-243`、`comfy_kitchen/backends/cuda/__init__.py` 的 `int8_linear` convrot 分支；
+- §10.3 nvfp4 存储量化：`full_precision_matrix_mult=true`、`ops.py:1160`、`pre_quant_scale` 的 AWQ 用法、model card 原文；
+- §10.4 量化覆盖面：按 `.weight` dtype 普查；
+- §10.5 LoRA：文件 metadata、alpha 张量实测值、A/B 形状、模块计数；
+- §10.6 文件完整性：setup 脚本清单 + 日志 + HF API；
+- §10.7 明确唯一属于“推断”的是 `pruned` 一词的语义，其余均为实测或源码/文档明文。
+
+文档现为 714 行、40,590 字节；代码围栏 24 个（成对）。
+
+### 52.7 用户反馈：§3.2/§3.3 的 pre_quant_scale 不一致与“weight std”
+
+用户指出三处问题：
+
+1. §3.2 的每层表只列了 `o_proj.pre_quant_scale`、`down_proj.pre_quant_scale`，但 §3.3 用 `q_proj` 举例时却列了 `pre_quant_scale`；
+2. §3.3 没有解释为什么只有 `o_proj` / `down_proj` 有 `pre_quant_scale`；
+3. “与权重 std 吻合”这句话里的“权重 std”含义不清、且未验证。
+
+核对与修正：
+
+- 实测 `pre_quant_scale` 键：全文件 100 个（50 层 × 2），模块名只有 `self_attn.o_proj` 和 `mlp.down_proj`；`q/k/v/gate/up` 均无。
+- 上游源仓库 `cybermotaz/Qwen3-VL-32B-Instruct-NVFP4` 第 1 个 shard（layer 0..8）同样只有 `o_proj`（9 个）与 `down_proj`（8 个）共 17 个，说明这是 modelopt NVFP4_AWQ 的导出层级，不是 Comfy-Org 转换新增。
+- §3.3 示例改为 `self_attn.o_proj`（同时具备 weight/block scale/tensor scale/pre_quant_scale 四个 side-car），并补充 `pre_quant_scale` 的分布、作用（`ops.py:1618-1620` 乘到输入）与源仓库对照。
+- “与权重 std 吻合”：原意是反量化后权重的标准差，但文件内没有 BF16 原权重，无法只凭 scale 证明逐值一致；已删除该断言，改为陈述可测量的 scale 算术（block scale × scale_2 = 每 16 权重的步长，o_proj row 0 约 8.8e-4..5.9e-3）。
+- 复核时用 Qwen3-VL-32B-Instruct BF16 的 q_proj 行做过对照：反量化值与 BF16 行高度相关，但不是逐值相等；该对照只用于确认 pack 顺序（hi_first=True），未作为精度结论写入文档。
+- 文档新增 §10.3(e) 记录这次修正；当前 726 行 / 42,852 字节，代码围栏 24 个（成对）。
+
+### 52.8 追问：DiT/ViT 全称与重新量化的 base 来源
+
+**全称**
+
+- DiT = Diffusion Transformer（扩散 Transformer）。此处指 MiniMax H3 的 video+audio 扩散主干（`MiniMaxH3DiTModel`，50 层，hidden 5376）。
+- ViT = Vision Transformer（视觉 Transformer）。文档里有两处：视频 VAE 的 36 层 3D ViT decoder（`ViT3DDecoder`），以及 Qwen3-VL 文本编码器里的 27 层 visual tower（`visual.*`）。
+
+**重新量化的 base（均已核对 header/大小）**
+
+| 目标文件 | BF16/FP16 base | 位置 | 规模 |
+|---|---|---|---|
+| DiT pruned int8 | pruned_bf16 | `Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors` | 40.23 GB / 20.111 B，532 tensor |
+| DiT 完整版 | bf16 | `Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_bf16.safetensors` | 66.28 GB / 33.123 B，535 tensor |
+| DiT 上游原始 | Diffusers shards | `MiniMaxAI/MiniMax-H3/FL2VA/transformer/*`（13 shards） | 66.28 GB，含 time_embedder |
+| TE nvfp4 | bf16（50 层截断版） | `Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors` | 51.51 GB / 25.753 B，902 tensor |
+| TE 原始完整 | 64 层 Qwen3-VL | `Qwen/Qwen3-VL-32B-Instruct` 或 `MiniMaxAI/MiniMax-H3/FL2VA/text_encoder` | 66.71 GB，64 层 + lm_head |
+| TE nvfp4 的直接来源 | NVFP4_AWQ 权重 | `cybermotaz/Qwen3-VL-32B-Instruct-NVFP4` | 21.861 GB，5 shards，64 层 + lm_head + visual，448 个 input_scale |
+| Video VAE int8 | fp16 | `Comfy-Org/MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors` | 5.21 GB / 2.604 B，562 tensor |
+| Video VAE 上游 | fp32 | `MiniMaxAI/MiniMax-H3/FL2VA/video_vae/source/model.safetensors` | 10.42 GB |
+| Audio VAE fp32 | 未量化（本身即 base） | `Comfy-Org/MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors`；上游 `FL2VA/audio_vae/model.safetensors` | 605 MB / 151.3 M |
+| LoRA | 不量化；merge 到 bf16 base | base 见 LoRA metadata（`minimax_h3_fl2va_bf16`）；训练源 `lightx2v/Minimax-h3-Turbo` | 1.96 GB / 978 M |
+
+**注意**
+
+- pruned 与 full 的差异是 AdaLN rank-8 曲线蒸馏；复现 int8 文件用 pruned_bf16，量化完整模型用 full bf16。
+- Comfy-Org 的 TE bf16 已做 50 层截断（0..49）、去掉 lm_head/model.norm、保留 visual；上游 Qwen3-VL-32B 是 64 层 + lm_head，需要自行截断与 key 映射（上游 key 为 `model.language_model.*`，Comfy-Org 为 `model.layers.*`）。
+- 现有 nvfp4 TE 的直接来源是 `cybermotaz/Qwen3-VL-32B-Instruct-NVFP4`（model card 原文；实测 2530 tensor / 21.861 GB / 64 层 / lm_head + visual / 448 input_scale）；Comfy-Org 在其基础上做 64→50 截断、去 lm_head/model.norm、key 改名、去掉 input_scale。若要复现该 nvfp4 文件，cybermotaz 是权重来源；若要从 BF16 从零重量化，用 Comfy-Org 的 50 层 bf16 更省事。详见文档 §3.5。
+- Ref2VA 也有对应 base：Comfy-Org `minimax_h3_ref2va_bf16` / `pruned_bf16`，上游 `Ref2VA/transformer`（同样 50 层、time_embed_dim 2688）。
+- ComfyUI 侧量化格式对应 `comfy.quant_ops`（int8_convrot / nvfp4），TE 的 NVFP4 AWQ 原始由 NVIDIA modelopt 0.40.0 导出。
+
+### 52.9 文档复核：对照 CUPTI / kernel 运行记录
+
+用户要求把“重新量化的 base 来源”补进分析文档，并用本目录的真实运行记录 `comfyui_h3_t2v_kernel_analysis.md` 与 `cupti_h3_t2v_kernel_report.md` 校验文档正确性。
+
+**先做的一致性核对**
+
+- `kernel_analysis` §1.1 的 4 个模型文件字节数（TE 15,687,142,551；DiT 20,970,379,616；video VAE 2,811,065,184；audio VAE 605,254,808）与本机文件完全一致，确认运行记录分析的就是本文档这 4 个文件。
+- 运行记录：B200（sm100）、ComfyUI v0.45.0、20 steps、864×480×124 帧、turbo_mode=false、0 patches。
+
+**实测确认**
+
+- DiT：4000 次 INT8 GEMM（20×50×4）+ 4000 次在线 ConvRot；1000 次 BF16 FlashAttention；200 个 int8 层；与文档 §2 一致。
+- TE：350 次 NVFP4 反量化（50×7）+ 350 次 FP32 GEMM + 50 次 FP32 attention + 200 次 FP32 layer_norm；与文档 §3 的 50 层×7 结构一致。
+- Video VAE：42 次 ViT × 36 层 × 4 = 6048 次 INT8 GEMM；1512 次 `qk_int_sv_i8_attn_kernel`；与文档 §4 的 36 层/144 个 int8 线性层一致。
+- Audio VAE：2,679 个 FP32 kernel，无 INT8/NVFP4；与文档 §5 一致。
+
+**发现并修正的错误**
+
+1. TE 计算 dtype：初版写“反量化成 BF16 后 F.linear”。CUPTI 实测是 `dequantize_nvfp4_kernel<...,float>` + `cutlass3x_sm100_simt_sgemm_f32`，即 FP32。已改 §0、§3.3、§7.3、§9、§10.3、§10 表格。
+2. Video VAE attention：初版只写了 144 个 int8 线性层，未提 attention 也是 INT8。CUPTI 实测 1512 次 `qk_int_sv_i8_attn_kernel`，已在 §4.2 补注。
+3. 参考文档 `kernel_analysis` §3.2/§7.4 写的是 `TimeEmbedder(256→5376→2688)`；但同一 DiT 文件没有 `time_embedder.*`，而是 `adaln_t_table [1025,8]` + `[96768,8]` AdaLN。`model_detection.py:421-425` 与 `model.py:524-527` 证明走 `use_adaln_curves` 分支。该差异不影响 CUPTI 的 4000 次 INT8 计数（AdaLN 不属于 200 个 int8 层），但参考文档这两段应视为沿用了 full 模型描述。已在分析文档 §12.2 记录。
+
+**新增内容**
+
+- §11 重新量化的 base 来源（五个文件）：DiT pruned/full、TE 50 层 BF16 / cybermotaz NVFP4 / 原始 Qwen、video VAE fp16/fp32 source、audio VAE fp32、LoRA 合并 base。
+- §12 与真实运行记录的交叉校验：12.1 确认表、12.2 修正项、12.3 未覆盖范围（LoRA 未加载、两个 VAE encoder 未执行、Ref2VA 未跑、B200 trace 的 GPU 边界）。
+
+**逐表复算又修正的内部不一致**（写入文档 §12.4）：
+
+- §2.4 功能归类表重复统计 AdaLN（0.072 B/0.36% → 0.029 B/0.14%，AdaLN 归 blocks）；
+- §3.2 层参数把 pre_quant side-car 计入（24.382 B → 24.380 B），并澄清 33,792 是每层元素数、全文件 1,689,600 个；
+- §2.5 fc1 scale 范围误用 qkv 的实测值（0.0006..0.0071 → 2.37e-4..7.89e-3）；
+- §4.3 decoder bias/scale 行少算 norm/scale（0.0014 B/2.9 MB → 0.0022 B/8.85 MB）；
+- §6.3 LoRA 表混用 50-block 与 52-block 统计并重复 token_refiner（改为四类 52-block 合计：qkv 536.74 M、fc1 226.62 M、fc2 131.20 M、out 83.49 M）；
+- §9 视频 VAE 92.9% → 92.8%。
+
+同时修正 `analyze_h3_safetensors.py`：`.alpha` 只在 LoRA 里当 side-car，Audio VAE 的 Snake alpha 计入参数；修正后五个文件的总参数为 20,111,438,744 / 25,753,095,920 / 2,603,871,080 / 151,287,320 / 978,059,264，与文档一致。
+
+文档现为 862 行 / 57,738 字节，代码围栏 24 个（成对）。
+
+### 52.10 追问：复现 nvfp4 权重时 AWQ scale 怎么办
+
+用户问：文档说 cybermotaz 是 nvfp4 的直接来源，那 AWQ 的 scale 怎么处理。
+
+核对结果（实测）：
+
+- `pre_quant_scale`（AWQ 输入侧平滑，BF16，仅 o_proj/down_proj）：**源仓库与 Comfy-Org 文件逐位相同**。抽查 `layers.0.self_attn.o_proj.pre_quant_scale`，`torch.equal` 为 True（范围 0.293..3.406、mean 2.045）。
+- `input_scale`（ModelOpt 静态激活 scale，F32 标量）：源仓库 448 个（64 层 ×7），Comfy-Org 文件 0 个；ComfyUI 的 `full_precision_matrix_mult` 路径不用它，ModelOpt/vLLM 路径才需要。
+- `weight_scale` / `weight_scale_2`（NVFP4 block/tensor scale，不是 AWQ scale）：`weight_scale_2` 抽查相同（5.958e-4）；但 `weight` 的 U8 字节顺序和 `weight_scale` 的数值/顺序与源不同。
+  - 实测 q_proj row0：源与目标的 4-bit code 直方图完全一致（同一批 code 的排列），但 U8 字节不同；block scale 多重集不同（源有 14.0，目标有 13.0）。
+  - `to_blocked`/`from_blocked` 不能直接复现差异，说明 Comfy-Org 的转换还包含 block 分组重排 + block scale 重算，不是简单 swizzle。
+- 结论：cybermotaz 是“量化权重来源”，不是“可直接拷贝的 ComfyUI 布局”。复现现有 nvfp4 文件最稳的是以 Comfy-Org 的 nvfp4 文件本身为 base；从 BF16 重做则用 Comfy-Org 的 50 层 bf16 重新量化，AWQ 的 `pre_quant_scale` 可复用（同 base/同层）或重新校准，`weight_scale`/`weight_scale_2` 必须由新量化器重新生成。
+
+已更新分析文档 §3.5（AWQ scale 与 block scale 处理）和 §11 note 3（cybermotaz 不能直接拷贝）。文档现为 870 行 / 59,384 字节。
+
+
+---
+
+# 独立校验 `minimax_h3_comfyorg_files_analysis.md`
+
+## 53. 任务、边界与最终结论
+
+用户要求校验 `minimax_h3_comfyorg_files_analysis.md` 的内容。该文件此前已有第 52 节的编写/修订记录，但本轮不沿用“已校验”的结论，重新对照本地 safetensors header、HF API/model card、上游 config 和必要的小范围张量数据。
+
+本轮边界：
+
+- 不修改被校验的原文，不修改 ComfyUI/comfy-kitchen 源码。
+- 不下载完整大模型、不启动/停止服务、不运行新的 GPU 推理。
+- 远程权重访问只用 HTTP Range 读取 header、scalar、scale 或单个 q_proj tensor。
+- CUPTI 部分复用此前已经验证的 `logs/cupti_h3_t2v/h3_t2v_cold.sqlite` 和分析报告，没有重复采集。
+- 完整过程写入本节，最终给用户错误清单和正确性边界。
+
+最终结论：**文档主体结构、五个文件的静态统计和运行时量化结论大部分正确，但不能原样视为完全正确。** 两处需要实质修正：
+
+1. cybermotaz → Comfy-Org 的 NVFP4 转换被错误解释为“重新计算 block scale、不能由布局重排复现”。完整 q_proj 实测证明：packed 权重仅高低 nibble 互换，block scale 仅标准 128x4 重排，二者都逐字节吻合。
+2. `pruned` 的分项参数差和 time_embedder 参数有算术错误。准确的 full/pruned 总差是 13,011,554,168，逐组对账后剩余差为 0。
+
+另有 license 过度概括、音频配置来源不精确、TE full-precision 引用了错误函数、少量 dtype 字节归属问题，详见 53.7。
+
+## 53.1 本地五个文件的独立复算
+
+先读 `analyze_h3_safetensors.py:1-157`。它只读 8-byte header length、JSON header 和小 `comfy_quant` blob，量化权重按 `weight_params()` 的逻辑 shape 计数；`.alpha` 只在 LoRA 中作为 side-car，Audio VAE 的 Snake alpha 不扣除。没有整模型 tensor 加载行为。
+
+实际执行：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+/home/kaokaolv/comfyui_h3/.venv/bin/python analyze_h3_safetensors.py
+```
+
+五个文件的全部汇总与原文一致：
+
+```text
+DiT:       20,970,379,616 B;  932 tensors; 20,111,438,744 params
+TE:        15,687,142,551 B; 2054 tensors; 25,753,095,920 params
+Video VAE:  2,811,065,184 B;  850 tensors;  2,603,871,080 params
+Audio VAE:    605,254,808 B;  917 tensors;    151,287,320 params
+LoRA:       1,956,193,000 B;  624 tensors;    978,059,264 params
+```
+
+量化计数也一致：DiT 200 × int8/ConvRot；TE 350 × NVFP4 full-precision-mm + 1 × int8 embedding；Video VAE 144 × int8/ConvRot；Audio VAE 全 F32；LoRA 全 BF16 + 208 个 alpha。
+
+随后独立使用 `weight_params()` 再算总参数，并验证 header 长度，避免直接信任汇总脚本：
+
+```bash
+python3 - <<'PY'
+import math, os, struct
+from analyze_h3_safetensors import load, weight_params, module_of
+expected = {
+    'diT': (932, 95416, 20111438744),
+    'TE': (2054, 231400, 25753095920),
+    'video_vae': (850, 99512, 2603871080),
+    'audio_vae': (917, 105520, 151287320),
+    'lora': (624, 73632, 978059264),
+}
+for key, (count, header_bytes, params) in expected.items():
+    path, hdr, meta, qinfo = load(key)
+    data_start = 8 + struct.unpack('<Q', open(path, 'rb').read(8))[0]
+    total = 0
+    for name, info in hdr.items():
+        if name.endswith(('.weight_scale', '.weight_scale_2', '.pre_quant_scale', '.comfy_quant')):
+            continue
+        if key == 'lora' and name.endswith('.alpha'):
+            continue
+        total += weight_params(module_of(name), info, qinfo)
+    assert len(hdr) == count
+    assert data_start - 8 == header_bytes
+    assert total == params
+    print(key, 'header_and_params_ok', os.path.getsize(path), data_start)
+PY
+```
+
+实际五个 `header_and_params_ok` 均通过。这里第一次检查脚本曾错误把 TE 所有非 visual `.weight`（包括 RMSNorm）都乘以 2，得到 25,753,620,720；该错误属于本轮检查脚本，不是原文。改用已有的 `weight_params()` 后恢复正确结果，未用这个错误结果评价原文。
+
+分组参数也吻合：
+
+```text
+DiT blocks=19,311,680,000; token_refiner=770,730,752;
+condition_proj=27,530,496; video_patch=521,472; audio_patch=177,408;
+final_layer=790,400; adaln_t_table=8,200; rope=16。
+
+TE model.layers=24,380,441,600; visual=595,266,800;
+embed_tokens=777,912,320。三层合计 25,753,095,920。
+
+Video VAE decoder=2,423,532,544; encoder=180,335,536;
+post_quant_conv=600; quant_conv=2,352; 两个 latent 统计向量各 24。
+
+Audio encoder=73,696,832; decoder=64,850,424;
+pre_block=12,670,304; dec_in_proj=67,584;
+mean_proj/logs_proj 各 1,056；latent mean/std 各 32。
+
+LoRA qkv=536,739,840; out=83,492,864;
+fc1=226,623,488; fc2=131,203,072。
+```
+
+抽样数值：
+
+```text
+DiT qkv scale: min=0.0006494268891, max=0.0070543666370
+DiT fc1 scale: min=0.0002368853893, max=0.0078861992806
+VAE qkv scale: min=0.0002093392104, max=0.0010878733592
+TE o_proj pre_quant_scale: min=0.29296875, max=3.40625,
+                           mean=2.0445358753204346
+LoRA alpha: {8.0: 156, 24.0: 52}
+```
+
+这些值与原文给出的四舍五入范围一致。
+
+## 53.2 HF 文件、hash 与 model card
+
+读取 `setup_comfyui_h3.sh:117-139` 和 `logs/setup_comfyui_h3.log:283-298`：固定 revision 为 `4b53a35191437de05370da548e59aeabe2a5a09a`，下载后执行 `sha256sum --check`，日志确有五个 `OK`。
+
+通过 FetchURL 读取 https://huggingface.co/Comfy-Org/MiniMax-H3 ，model card 确实列出四个原始来源、cybermotaz 的 NVFP4 来源、无需 Blackwell 的说明以及 int8 ConvRot 的优先级建议。
+
+FetchURL 对 `/api/models/Comfy-Org/MiniMax-H3?blobs=true` 报“无法提取 meaningful content”。这是 JSON 正文提取限制，不是权限错误。随后改用公开 API 的 Python 只读请求筛选需要的文件，不经过登录、不读取凭据：
+
+```bash
+python3 - <<'PY'
+import json
+from urllib.request import Request, urlopen
+repos = (
+    'Comfy-Org/MiniMax-H3',
+    'MiniMaxAI/MiniMax-H3',
+    'cybermotaz/Qwen3-VL-32B-Instruct-NVFP4',
+    'Qwen/Qwen3-VL-32B-Instruct',
+    'lightx2v/Minimax-h3-Turbo',
+)
+for repo in repos:
+    req = Request(
+        f'https://huggingface.co/api/models/{repo}?blobs=true',
+        headers={'User-Agent': 'h3-document-verification'})
+    with urlopen(req, timeout=45) as r:
+        info = json.load(r)
+    card = info.get('cardData') or {}
+    print(repo, info.get('sha'), card.get('license'),
+          card.get('license_name'), card.get('license_link'))
+    for f in info.get('siblings', []):
+        if f['rfilename'].endswith('.safetensors'):
+            # 对 Comfy-Org 输出本文涉及的 8 个目标文件；
+            # 对其他仓库累加 safetensors size。
+            pass
+PY
+```
+
+实际输出确认：
+
+- 当前 Comfy-Org revision 与 setup 固定 revision 完全一致。
+- 五个本地文件的大小和五个 LFS sha256 都与原文/脚本清单一致。
+- `pruned_bf16`：40,225,724,176 B，oid `a32572fb...d541b4`。
+- TE BF16：51,506,295,256 B，oid `600d567f...0607d`。
+- Video VAE FP16：5,207,808,496 B，oid `7c1f1314...ce5e522`。
+- cybermotaz 五个 shard 总字节 21,861,337,872 B。
+- Qwen/Qwen3-VL-32B-Instruct  safetensors 总字节 66,714,912,872 B。
+
+本轮没有重新计算约 41 GB 的本地全量 sha256。原文 §10.6 把完整性限定为“下载时校验 + 当前大小一致”，这个证据边界是准确的，不能把它升级表述为本次又做了一次全量 hash。
+
+## 53.3 上游 config 与 base header
+
+通过 FetchURL 读取：
+
+```text
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/FL2VA/transformer/config.json
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/FL2VA/text_encoder/config.json
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/FL2VA/video_vae/config.json
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/FL2VA/video_vae/source/config.json
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/FL2VA/audio_vae/config.json
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/FL2VA/audio_vae/config.yaml
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/FL2VA/audio_vae/metadata.json
+https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/Ref2VA/transformer/config.json
+https://huggingface.co/cybermotaz/Qwen3-VL-32B-Instruct-NVFP4/resolve/main/config.json
+```
+
+结果：
+
+- DiT hidden=5376、50 层、56×128 heads、ffn=14336、time_embed_dim=2688、AdaLN 输出 96768，正确。
+- Qwen text_config hidden=5120、64 层、64 Q heads、8 KV heads、intermediate=25600；vision 27 层、1152、16 heads、4304、patch 16、merge 2，正确。
+- Video VAE 的 source config、36 层 ViT、32×64、16×/4× downscale 等正确。
+- Audio `config.json` 有 32 kHz、32 latent channels、2 声道；`metadata.json` 的 kwargs 与本地 safetensors 中的 `minimax_h3_audio_vae.kwargs` 完全一致，包括两组 rates 和 BigVGAN。
+- **上游 `config.yaml` 实际只有 `model_config.sr/decoder_dim/audio_channel/vae_latent_channels` 四项。** 原文 §1.2 把 encoder_rates、decoder_rates、encoder_dim 等笼统归到 `config.json + config.yaml`，证据归属不准确；应引用 `metadata.json`、本地 safetensors metadata 和 ComfyUI `audio_vae.py`。
+- Ref2VA config 也确实是 50 层、time_embed_dim=2688。
+- cybermotaz `config.json` 确有 `quant_algo=NVFP4_AWQ`、modelopt 0.40.0、`ignore=[lm_head,model.visual*]`。请求的 `hf_quantizer.json` 返回 404，不影响已存在的 `config.json` 证据；没有声称该文件存在。
+
+使用 HTTP Range 只读三份推荐 base 和两个上游 VAE 的 header。`Range: bytes=0-1048575`，仅解析 8B 长度和 JSON header，结果：
+
+```text
+pruned_bf16: 532 tensors; 20,111,438,744 params;
+             BF16/F16/F32 混合，无 time_embedder。
+TE BF16:     902 tensors; 25,753,095,920 params; 50 层;
+             无 lm_head/model.norm，metadata=minimax_h3_te。
+Video FP16:  562 tensors;  2,603,871,080 params; 全 F16。
+Video source:560 tensors;  2,603,871,032 params; 全 F32。
+Audio source:1087 tensors; 151,326,585 params; 全 F32。
+```
+
+TE BF16 与 NVFP4 文件做了逐 key 对照：非 side-car key 都是 902 个，差集为空；恰好 350 个 Linear 变为 packed half-width，其他 key shape 完全相同。原文“50 层 BF16 是方便的重新量化 base、key 一一对应”成立。
+
+Video source 比 FP16 base 少 `latents_mean/std` 两个向量（48 个元素），结构相符。Audio source 是 1087 tensors，而 Comfy-Org 文件是 917 个，不能把“上游是 base”误解为已经证明逐 key/逐值相同；原文没有明确声称相同，但后续若直接转换上游音频，仍需单独做 key 映射和数值验证。
+
+## 53.4 `pruned` 精确对账：主结论正确，分项算术错误
+
+先按文档 shape 直接计算：
+
+```bash
+python3 - <<'PY'
+N, D, R = 96768, 2688, 8
+block_delta = N * (D - R)
+final_delta = 10752 * (D - R)
+time_embedder = 5376 * 256 + 5376 + 2688 * 5376 + 2688
+print('full_block_adaln_weight', N * D)
+print('pruned_block_adaln_weight', N * R)
+print('per_block_delta', block_delta)
+print('50_block_delta', 50 * block_delta)
+print('final_delta', final_delta)
+print('time_embedder_including_bias', time_embedder)
+print('table', 1025 * 8)
+print('total_delta', 50 * block_delta + final_delta + time_embedder - 1025 * 8)
+PY
+```
+
+正确结果：
+
+```text
+full block AdaLN weight       260,112,384
+pruned block AdaLN weight         774,144
+per-block delta               259,338,240   # 原文写 259,272,704，错误
+50-block delta             12,966,912,000   # 原文写 12,963,635,200，错误
+final AdaLN delta              28,815,360
+TimeEmbedder incl. bias        15,835,008   # 原文写 15,835,584，错误
+adaln_t_table                      -8,200
+总差                       13,011,554,168
+```
+
+随后读取 `FL2VA/transformer/model.safetensors.index.json`，对 13 个 shard 逐一发 Range header 请求。关键脚本逻辑（每个 shard 都只读 8B 长度和 JSON，pop `__metadata__`，合并去重，再与本地 DiT 逐 key 比对）：
+
+```python
+index = json.loads(fetch_bytes(BASE + 'model.safetensors.index.json'))
+full = {}
+for shard in sorted(set(index['weight_map'].values())):
+    status, n, hdr = fetch_header(BASE + shard)  # HTTP Range
+    hdr.pop('__metadata__', None)
+    assert not (set(full) & set(hdr))
+    full.update(hdr)
+full_total = sum(math.prod(v['shape']) for v in full.values())
+# 本地 int8 每元素仍是一个逻辑参数，仅排除 weight_scale/comfy_quant。
+local_total = sum(math.prod(v['shape']) for k, v in local.items()
+                  if not k.endswith(('.weight_scale', '.comfy_quant')))
+```
+
+13 个请求均返回 HTTP 206；JSON header 连同长度字段总计只读取 55,792 B。实测：
+
+```text
+full:  535 tensors, 33,122,992,912 params
+local: 932 tensors, 20,111,438,744 params
+actual_delta = 13,011,554,168
+
+only_full = time_embedder.proj_in.{weight,bias},
+            time_embedder.proj_out.{weight,bias}
+only_local 共 401 个 = 200 weight_scale + 200 comfy_quant + adaln_t_table
+shared shape change = 51 个，恰好 50 个 block AdaLN + final AdaLN；
+                      其他 shared shape 无变化。
+
+group_delta blocks         = 12,966,912,000
+group_delta final_layer    =     28,815,360
+group_delta time_embedder  =     15,835,008
+group_delta adaln_t_table  =         -8,200
+token_refiner/condition/video/audio patch/rope 的 delta 全为 0。
+unexplained_delta = 0
+```
+
+因此应把原文“0.004 B 误差来自 bias/对齐”改成：**精确参数差 13,011,554,168，结构分项完全解释，剩余差为 0。**
+
+主结论仍然成立：没有删除 50 个 transformer block；full-only key 只有 time_embedder 四个 tensor，shape 改变只在 AdaLN 投影。`rank-8 曲线蒸馏`的具体训练来源仍是“源码 + 数据推断”，不是 model card 明文，原文 §10 的推断标签应保留。
+
+Comfy-Org `pruned_bf16` 的 532 tensors/20,111,438,744 params 也直接核对通过，与 int8 文件逻辑参数相同。
+
+## 53.5 TE 上游转换：原文结论被完整 q_proj 反证
+
+这是本轮最重要的实质修正。
+
+### 源仓库结构核对
+
+读取 cybermotaz 的 index 和 5 个 shard header：
+
+```text
+2530 tensors；64 层；448 input_scale；128 pre_quant_scale；
+lm_head.weight 存在；model.language_model.norm.weight 存在。
+q_proj weight:       U8 [8192,2560]
+q_proj weight_scale: F8_E4M3 [8192,320]
+```
+
+与原文这些结构数字一致。
+
+### 完整 packed q_proj 权重
+
+读取源 `model.language_model.layers.0.self_attn.q_proj.weight` 的完整 20,971,520 B 和本地对应 tensor。远程访问为对单个 tensor 的 Range 请求，不是下载 21.86 GB 模型。核心代码：
+
+```python
+info = source_header['model.language_model.layers.0.self_attn.q_proj.weight']
+lo, hi = info['data_offsets']
+source = remote_range(8 + header_len + lo, 8 + header_len + hi - 1)
+target = read_blob(local_path, local_data_start,
+                   local_header['model.layers.0.self_attn.q_proj.weight'])
+assert len(source) == len(target) == 8192 * 2560
+swapped = bytes((v >> 4) | ((v & 15) << 4) for v in source)
+print('raw_equal', source == target)
+print('nibble_swap_equal', swapped == target)
+print('nibble_swap_mismatch_count', sum(a != b for a, b in zip(swapped, target)))
+```
+
+实际输出：
+
+```text
+q_proj_packed_bytes 20971520
+raw_equal False
+nibble_swap_equal True
+nibble_swap_mismatch_count 0
+```
+
+即：**源和目标包含完全相同的 4-bit code，只是每 byte 内高低 nibble 顺序不同。** 不需要重新量化。
+
+### 完整 q_proj block scale
+
+读取源/目标全部 `[8192,320]` scale，共 2,621,440 B。按 vLLM/CUTLASS 同样语义计算：
+
+```python
+R, G = 8192, 320
+blocked = bytearray(len(source_scale))
+mt_count, kt_count = (R + 127) // 128, (G + 3) // 4
+for r in range(R):
+    mt, outer, inner = r // 128, r % 32, (r // 32) % 4
+    for g in range(G):
+        kt, kg = g // 4, g % 4
+        out_index = ((((mt * kt_count + kt) * 32 + outer) * 4 + inner) * 4 + kg)
+        blocked[out_index] = source_scale[r * G + g]
+print(bytes(blocked) == target_scale)
+```
+
+实际结果：
+
+```text
+scale_raw_equal False
+scale_128x4_relayout_equal True
+source_scale_unique_count = target_scale_unique_count = 69
+scale_histogram_equal True
+```
+
+因此：**目标 scale 是源 scale 的标准 128x4 重排，数值集合与每个值的出现次数全部一致。** 目标第一行 raw scale 与源第一行不同，是重排导致取自其他源位置，不是 scale 被重新计算。
+
+此外：
+
+- `weight_scale_2` 原始 4 bytes 完全相同，值均为 `0.0005958193796686828`。
+- `o_proj.pre_quant_scale` 全部 16,384 bytes 完全相同，AWQ pre_quant 确实保留。
+- 原文 §3.5、§11 note 3 中“block scale 多重集不同、重新计算、to_blocked/from_blocked 不能复现”的概括与完整 q_proj 数据矛盾，必须修正。
+
+正确表述应为：
+
+> cybermotaz 可以作为量化权重来源。至少对完整 q_proj 已证明，Comfy-Org 的转换是 key/截断处理、4-bit nibble 顺序转换和 block scale 的 128x4 重排，q value 与 scale 数值不变，不需要重新量化或重新校准。若要直接裸拷贝 byte 仍不可行，因为 packing/layout 不同。
+
+证据边界：本轮对 q_proj 的整个 qdata 和整个 scale 做了完整证明，对 o_proj 的 pre_quant 做了完整证明；**没有下载并逐值比较全部 350 层**，所以不能进一步声称全部层已经完成同样的逐值校验。但完整 q_proj 已足以否定原文对整份文件的“scale 重算”概括。
+
+### 本轮行截取错误及处理
+
+最初尝试只读 q_proj row 0 时，脚本误写成 `hi = lo + hi // shape[0]`，没有先减 `lo`，远程读到了 395,257 B 而非一行 2,560 B。该轮的 nibble histogram 不相等结果已丢弃，未用于结论。正确公式为 `hi = lo + (hi-lo)//shape[0]`；随后进一步读取完整 q_proj tensor 做最终证明，避免只凭单行直方图推断。
+
+## 53.6 LoRA、运行链和 base 来源复核
+
+- LoRA 624 tensors = 416 A/B + 208 alpha；alpha 8.0×156、24.0×52；四类参数精确合计 978,059,264，和文档一致。metadata 的 base、rank、scale、QKV block diagonal、SwiGLU 顺序均与原文一致。
+- 参考运行未加载 LoRA；文档已明确其运行时边界，没有误把静态分析当成 LoRA kernel 证据。
+- 之前已验证的 CUPTI 数据仍支持：DiT 4000 INT8 GEMM + 1000 BF16 FlashAttention；Qwen 350 NVFP4 dequant + 350 FP32 GEMM + 50 FP32 attention；Video VAE 6048 INT8 GEMM + 1512 Sage INT8 attention；Audio VAE 2679 个 FP32 相关 kernel。
+- 两个 VAE encoder、LoRA 和 Ref2VA 不在该 T2V trace 中，原文 §12.3 已正确声明，本轮没有扩大运行时覆盖范围。
+- `comfyui_h3_t2v_kernel_analysis.md:269,307,865` 仍把当前 pruned checkpoint 描述为 `TimeEmbedder`，与本文件实际 `adaln_t_table` 分支不符；被校验文档 §12.2 指出这一跨文档问题是正确的。本轮没有擅自修改那份旧文档。
+- DiT `full_precision_mm`、视频 VAE residual、Sage INT8 attention 和音频 FP32 的既有源码/CUPTI 结论未发现新问题。
+
+## 53.7 其余需要修正或加注的地方
+
+### A. TE full-precision 的源码引用不准确
+
+原文 §3.3、§10.3 用 `ComfyUI/comfy/ops.py:1160` 的 `_v_weight` 代码证明 TE 反量化。该行实际属于 `CombinedLinear.linear_input_act`；`CombinedLinear.prepare` 在 `ops.py:1136-1140` 排除非 INT8 系列格式，不能拿它直接代表 NVFP4 文本编码器。
+
+TE 的正确直接证据是：
+
+- `ComfyUI/comfy/sd1_clip.py:109-115`：文本编码器量化默认 `full_precision_mm=True`。
+- `ComfyUI/comfy/ops.py:1381-1385`：读取 checkpoint 的 full-precision flag。
+- `ComfyUI/comfy/ops.py:1597-1599`：`MixedPrecisionOps.Linear.forward_comfy_cast_weights` 在 `_full_precision_mm` 时 `weight.dequantize()` 后 `_forward`。
+
+CUPTI 已经独立确认实际 FP32 路径，所以这是**引用函数错误，不是 FP32 结论错误**。
+
+### B. TE 磁盘构成的标签不精确
+
+原文 §3.4 的 U8 字节数 `12,189,715,279` 实际是：
+
+```text
+350 个 packed weight = 12,189,696,000 B
+351 个 comfy_quant   =         19,279 B
+合计                 = 12,189,715,279 B
+```
+
+因此“U8（350 个 NVFP4 权重）”的标签漏掉了 comfy_quant 元数据；总数没错，权重和元数据应拆开。
+
+原文 F32 `609,144 B` 实际是：
+
+```text
+350 个 weight_scale_2 标量      =   1,400 B
+embedding 的 151,936 个 F32 scale = 607,744 B
+合计                              = 609,144 B
+```
+
+不能只标为“350 个 tensor scale”，应补充 embedding per-row scale。上述不影响 4.87 bit/参数的有效位宽结论。
+
+### C. License 概括错误
+
+原文 §11 note 7 写“这些 base 均在 MiniMax-H3 Community License 下”。HF API 实际为：
+
+- Comfy-Org/MiniMax-H3、MiniMaxAI/MiniMax-H3、lightx2v/Minimax-h3-Turbo：MiniMax H3 Community License。
+- Qwen/Qwen3-VL-32B-Instruct：`license=apache-2.0`。
+- cybermotaz：`license=other`、`license_name=qwen`，并链接 Qwen LICENSE，不是 MiniMax license。
+
+应改成“分别遵循各仓库 license；MiniMax 系列检查 MiniMax license，Qwen 及其派生权重检查 Qwen/Apache 等对应许可”，不能统一归为 MiniMax。
+
+### D. Audio config 来源
+
+如 53.3 所述，结构值本身正确，但 rates 等应引用 `metadata.json` / 本地 metadata / `audio_vae.py`，不是只有四行的 `config.yaml`。
+
+### E. 不应过度推广的结论
+
+- full/pruned 的文件大小差还受 shard header 数量和 FP32/BF16/F16 混合 dtype 影响，不能把“bf16 文件差”说成逐 byte 都仅由逻辑参数差决定。精确逻辑参数差已由 53.4 完整证明。
+- 音频上游与 Comfy-Org 文件 tensor 数不同，后续直接转换时需另做映射。
+- LoRA、两个 encoder、Ref2VA 仍无本轮运行时证据。
+
+## 53.8 工具/脚本问题与解决过程汇总
+
+1. 首次合并上游 shard header 把每个文件都有的 `__metadata__` 当成重复 tensor，触发 `AssertionError: {'__metadata__'}`。修正为 `hdr.pop('__metadata__', None)` 后成功，535 个真实 tensor 无重复。
+2. 初次远程 q_proj row 截取公式少了 `-lo`，读出 395,257 B；丢弃该轮 histogram，改读完整 q_proj 得最终零差异结论。
+3. 初次本地 TE 汇总把 RMSNorm 也乘 2，导致多 524,800 参数；改用已有 `weight_params()` 后五个 header/参数断言全部通过。
+4. FetchURL 无法提取 HF API 的 JSON，改用公开 API 的 Python `urlopen` 只读请求，不经过认证。没有访问任何 secret 文件。
+5. `hf_quantizer.json` 返回 404；改由实际存在的 `config.json` 核实 modelopt 0.40.0/NVFP4_AWQ，未把 404 当作格式不存在。
+6. 根目录宽泛 Glob 多次超时；改用已知文件的 Read、明确的远程 URL 和本地脚本。超时结果未用于证据。
+7. `git status --short` 与 `git diff --check` 均无输出，ComfyUI tracked 源码未修改。
+8. Python import 在本轮生成了 `__pycache__/analyze_h3_safetensors.cpython-312.pyc`，`stat` 确认是本轮临时产物，已删除；空目录已清理，没有删除其他文件。
+
+## 53.9 交付边界
+
+本轮没有修改 `minimax_h3_comfyorg_files_analysis.md`，因此以上是需要用户/后续编辑采纳的校验意见，不是已写回原文的修订。
+
+已确认可信的主体：五文件大小、tensor/header 统计、逻辑参数、主要结构、量化覆盖、LoRA 参数、既有 CUPTI 精度结论和推荐的三份 BF16/FP16 base。
+
+必须优先修正的原文位置：
+
+- §2.3 / §10.1：`pruned` 的分项数字、time_embedder 和“bias/对齐误差”解释。
+- §3.5 / §11 note 3：cybermotaz 的 qdata/scale 转换解释。
+- §11 note 7：统一 license 的错误概括。
+- §3.3 / §10.3：TE full-precision 的直接源码引用。
+- §3.4：U8/F32 字节归属标签。
+- §1.2：音频 `config.yaml` 的证据来源。
+
+
+---
+
+# 面向 Presentation 的汇总文档
+
+## 54. 任务、材料和大纲定位
+
+用户希望在已有技术分析与执行记录的基础上，完善一份用于 presentation 的文档：不要求像源码/kernel 报告那样展开全部细节，但要求介绍清晰、逻辑有条理、要点准确。指定参考：
+
+- `comfyui_h3_t2v_kernel_analysis.md`
+- `cupti_h3_t2v_kernel_report.md`
+- `comfyui_h3_mxfp8_mxfp4_proposal.md`
+- `minimax_h3_comfyorg_files_analysis.md`
+- `run_book.md`
+- `run_book_quant.md`
+
+用户提到的 `presentation.md` 最初在 `/home/kaokaolv/comfyui_h3` 不存在。读取 `report.md` 后发现它正是用户描述的三段式大纲：
+
+1. `video_minimax_h3_t2v.json` 的执行逻辑、涉及模型和源模型/BF16 模型；
+2. 每个模型的函数调用栈、dense Linear、attention 和实际 kernel；
+3. 用源模型支持 MXFP4/MXFP8，包括 auto-round model-free 量化、ComfyUI/FlashInfer 与 vLLM-Omni 两条路线及差异。
+
+因此保留 `report.md` 原样，按此大纲**新建 `presentation.md`**。没有因为文件名缺失而向用户反复询问，也没有覆盖 `report.md`。
+
+## 54.1 证据提炼与演示主线
+
+采用以下叙事顺序：
+
+```text
+真实输出与执行流程
+  → 四个基础模型及源模型/BF16 base
+  → 各模型的函数链、dense Linear 和 attention 真实 kernel
+  → CUPTI 对性能现象的解释
+  → BF16/FP16 到 MXFP8/MXFP4 的量化策略
+  → 原生 ComfyUI 与 vLLM-Omni 的路线对比
+  → 分阶段验收建议
+```
+
+重点区分三类状态：
+
+- **已实测跑通**：原生 ComfyUI 的 T2V、媒体输出、显存采样和 CUPTI kernel 分析。
+- **已完成部分量化**：DiT 200 个 Linear 的 MXFP8 权重、文件格式和代表层反量化验证。
+- **仍是设计/待验证**：MXFP8/MXFP4 真 GEMM、完整量化 T2V、Qwen MXFP4、视频 VAE MXFP8、vLLM-Omni 实际服务和 XPU 扩展。
+
+没有将 proposal 中的接口或 FlashInfer 路线写成已部署功能。
+
+## 54.2 写入的主要内容
+
+### 执行流程与基线
+
+- 纯文本输入，无首尾帧；`turbo_mode=false`，0 patches，未加载 LoRA。
+- 一次 Qwen 编码和 token refiner，20 步联合音视频 DiT 去噪，视频/音频 VAE 解码，CreateVideo/SaveVideo 输出。
+- 864×480、24 fps、124 帧、32 kHz 双声道；实际 packed sequence `[388 text | 414 audio | 14,985 video]`，S=15,787。
+- 原始冷启动客户端总耗时 953.3 s；独立 CUPTI 的 DiT 第一步 host range 178.617 s，第 2–20 步约 1.16 s，明确两者不能混为稳定吞吐。
+- 原始执行 NVML 峰值 38,570 MiB，出现在视频 VAE 解码阶段。
+
+### 模型、来源与 pruned
+
+- DiT 20.111B / 20.970 GB，base 为 40.226 GB 的 pruned BF16；50 层不变。
+- Qwen 文件 25.753B / 15.687 GB，base 为 51.506 GB 的 50 层 BF16，含 visual tower 和 embedding。
+- 视频 VAE 2.604B / 2.811 GB，base 为 5.208 GB 的 FP16 文件；T2V 只跑 decoder。
+- 音频 VAE 0.1513B / 0.605 GB，FP32；T2V 只跑 BigVGAN decoder。
+- 补充可选 8-step Turbo LoRA 的来源，但明确本次未加载。
+- 使用第 53 节独立核验后的精确数字：full 33,122,992,912，pruned 20,111,438,744，差 13,011,554,168；不是删层，而是 AdaLN 时间分支从全宽输入变成 8 维曲线形式。
+- 没有复制原文件中已经被反证的“NVFP4 scale 重算”说法，而是写明 q_proj 实测支持 nibble/scale 布局转换。
+
+### 真实函数/kernel
+
+用一张主表清晰对应模型、函数链、dense Linear 和 attention：
+
+- Qwen：NVFP4 存储 → FP32 dequant/GEMM，350 次；FP32 mem-efficient attention 50 次。
+- DiT：ConvRot + INT8 GEMM 4000 次；BF16 FlashAttention 1000 次。
+- 视频 VAE：INT8 GEMM 6048 次；Sage INT8 attention 1512 次；42 次 ViT forward 来自时间/空间 tiling。
+- 音频 VAE：FP32 Conv/Snake 等，2679 个 kernel，无 INT8/NVFP4。
+- 用 34.030 s 的 DiT kernel work 说明 FlashAttention 约 51.9%、INT8 GEMM 约 36.5%，并明确这不是 wall-time 占比。
+- 保留 allocation graph 不等于整模型 CUDA Graph replay、Qwen 不走 scaled_mm_nvfp4 等关键防误判结论。
+
+### 量化与两条路线
+
+- DiT 200 Linear、视频 VAE 144 Linear 从 BF16/FP16 转 MXFP8；Qwen 350 Linear 从 BF16 转 MXFP4；其他精度保持不变。
+- 单独补充 INT8 embedding 保持现有格式，避免“INT8 模型全部转 MXFP8”的歧义。
+- auto-round 初版使用 model-free 逐层量化，后续才考虑 tuning/AWQ/scale search。
+- 原生路线保持 `.comfy_quant + QuantizedTensor + mixed_precision_ops`，由 Comfy-Kitchen 做候选选择、FlashInfer 提供 B200 MX GEMM；明确禁止静默回退。
+- vLLM-Omni 使用远程 API 和官方远程 workflow；优先官方 BF16 + 在线 FP8，在线 MXFP8 是 H3 视频未验证实验路线；QAD 是不同 8-step 模型变体。
+- 对比两条路线在 workflow、模型格式、推理位置、量化方式和当前状态上的差异，不把它们的采样参数或输出直接混比。
+- 最后给出 B200 小矩阵、量化文件、垂直切片、同条件对照、CUPTI、综合指标、后续优化/XPU 的实施顺序。
+
+## 54.3 最新量化结果和补充修订
+
+初稿完成后重新读取 `run_book_quant.md`，发现新增第 3 节 INT8 ConvRot 与 BF16 base 的反量化对照。已把以下最新结果补入 presentation：
+
+- INT8 ConvRot 主投影权重 rel_RMSE：0.897%–1.211%。
+- MXFP8 主投影权重 rel_RMSE：2.661%–2.662%。
+- 这些层的 INT8 权重 RMSE 约为 MXFP8 的 1/2.2–1/3。
+
+特别注明：这只是**同一 BF16 base 的权重误差对比**，不是端到端画质、速度或真实 GEMM 验证结论。没有加入与 presentation 无关的 float32 cosine 累加异常细节。
+
+最终 `run_book_quant.md` 的 mtime 为 `2026-11-17 07:02:51 -0800`，文件末尾仍为第 3.3 节；没有遗漏更新的完整 T2V/MXFP GEMM 结果，因为该记录仍明确写“未做完整 T2V”。
+
+## 54.4 文件、链接和事实检查
+
+实际执行：
+
+```bash
+python3 -B - <<'PY'
+from pathlib import Path
+import re
+p = Path('/home/kaokaolv/comfyui_h3/presentation.md')
+s = p.read_text()
+assert s.count('```') % 2 == 0, 'unpaired code fence'
+for title in ['## 一页结论', '## 1. ComfyUI workflow', '## 2. Flow 中的模型',
+              '## 3. 函数调用逻辑与真实 Kernel', '## 4. 用源模型支持 MXFP8 / MXFP4',
+              '## 5. 总结']:
+    assert title in s, title
+for value in ['15,787', '13,011,554,168', '95,226', '4000 次', '6048 次',
+              '2.66%', '38,570 MiB', '953.3 s', '0.897%–1.211%', '2.661%–2.662%']:
+    assert value in s, value
+for value in ['尚未完成', '不是 FP4 GEMM', '不能原样执行当前 JSON',
+              '禁止静默回退', '这是权重误差对比，不是端到端画质或速度结论',
+              'INT8 embedding']:
+    assert value in s, value
+links = re.findall(r'\]\((\./[^)]+)\)', s)
+for link in links:
+    path = link.split('#', 1)[0]
+    assert (p.parent / path).exists(), link
+print('presentation_final_checks_passed')
+print('lines:', len(s.splitlines()), 'bytes:', len(s.encode()),
+      'local_links:', len(links), 'code_fences:', s.count('```'))
+PY
+
+git -C /home/kaokaolv/comfyui_h3/ComfyUI status --short
+git -C /home/kaokaolv/comfyui_h3/ComfyUI diff --check
+```
+
+实际输出：
+
+```text
+presentation_final_checks_passed
+lines: 331 bytes: 19586 local_links: 10 code_fences: 14
+```
+
+`git status --short` 和 `git diff --check` 均无输出。本轮只新增 `presentation.md` 并追加本记录，没有修改 ComfyUI 源码、`report.md`、proposal 或其他技术文档。没有启动/停止服务、运行新模型或重新采集 CUPTI。
+
+最终交付：[presentation.md](./presentation.md)。文档保留大纲主体，增加一页结论、清晰的模型/来源表、函数/kernel 对照、实测性能解释、两条 MXFP 推理路线和分阶段验收建议。
+
+
+---
+
+# Presentation 补充：其它模型 Kernel 构成与 INT8 反量化误差
+
+## 55. 任务与证据来源
+
+用户要求在 `presentation.md` 第三节增加其它模型的 kernel 构成，形式参照“3.3 DiT：kernel work 的构成”；并在 4.3 节增加 `int8_convrot` 反量化误差分析表，参考 `minimax_h3_comfyorg_files_analysis.md`。
+
+本轮不重新跑模型，直接使用此前已经验证的 CUPTI 数据：
+
+- `logs/cupti_h3_t2v/h3_t2v_cold.sqlite`
+- `logs/cupti_h3_t2v/analysis/phase_kernel_summary.csv`
+- `logs/cupti_h3_t2v/analysis/range_summary.csv`
+- `logs/cupti_h3_t2v/analysis/manifest.json`
+
+误差数据来自 `run_book_quant.md` 第 3 节，格式与 scale 语义来自 `minimax_h3_comfyorg_files_analysis.md` §2.5。
+
+分析对象是本次 T2V 实际执行的 **Qwen、视频 VAE、音频 VAE**。未加载 LoRA 和两个 VAE encoder 不被虚构为已有运行时 kernel 证据。
+
+## 55.1 原始 kernel 数据提取
+
+使用 Python 标准库 `csv` 读取 `phase_kernel_summary.csv`，按 `range_group` 汇总每个 kernel 的 `count/total_ns`，先打印各阶段总 kernel 数、GPU work 和按时间排序的主要 kernel。
+
+实际命令的核心逻辑：
+
+```bash
+python3 -B - <<'PY'
+import csv
+from collections import defaultdict
+path = '/home/kaokaolv/comfyui_h3/logs/cupti_h3_t2v/analysis/phase_kernel_summary.csv'
+groups = defaultdict(list)
+with open(path, newline='') as f:
+    for row in csv.DictReader(f):
+        row['count'] = int(row['count'])
+        row['total_ns'] = int(row['total_ns'])
+        groups[row['range_group']].append(row)
+for group in ('H3.text.qwen', 'H3.text.refiner', 'H3.video_vae.all_vit',
+              'H3.video_vae.decode', 'H3.audio_vae.decode'):
+    rows = groups[group]
+    count = sum(r['count'] for r in rows)
+    total = sum(r['total_ns'] for r in rows)
+    print(group, 'kernels=', count, 'work_ms=', total / 1e6)
+    for r in sorted(rows, key=lambda r: r['total_ns'], reverse=True)[:24]:
+        print(r['count'], r['total_ns'] / 1e6, r['kernel'])
+PY
+```
+
+汇总时只合并 kernel duration，不把 host range、memcpy 或 CUDA runtime API time 混进 kernel work。
+
+## 55.2 Qwen 的 kernel work 构成
+
+按以下精确名称分类：
+
+- FP32 GEMM：`simt_sgemm_f32`。
+- NVFP4 反量化：`dequantize_nvfp4_kernel`。
+- FP32 attention：`fmha_cutlassF_f32`。
+- 其余为 RMSNorm、RoPE、copy 和其他 pointwise。
+
+结果：
+
+| 类别 | 次数 | GPU work | 占比 |
+|---|---:|---:|---:|
+| FP32 GEMM | 350 | 397.036370 ms | 89.4074% |
+| NVFP4 dequant | 350 | 26.807478 ms | 6.0367% |
+| FP32 attention | 50 | 10.114768 ms | 2.2777% |
+| 其他 | 1616 | 10.116786 ms | 2.2782% |
+| 合计 | 2366 | 444.075402 ms | 100% |
+
+演示中重点说明：FP32 普通 GEMM 占接近九成 GPU work；但 Qwen host range 为 113.043 s，冷启动的权重准备/offload 仍是端到端延迟的重要部分，不能只看 GEMM。
+
+## 55.3 视频 VAE 的 kernel work 构成与归类修正
+
+ViT 内的精确分类：
+
+- INT8 GEMM：以 `void cutlass::Kernel2` 开头的 kernel。
+- ConvRot：`quantize_int8_rowwise_convrot64`。
+- Sage attention：`qk_int_sv_i8_attn_kernel`。
+- fused RMS+RoPE：`comfy::<unnamed>::rope_kernel`。
+- attention 的 Q/K/V 量化：`quant_qk_fused` 或 `quant_v_int8_kernel`。
+- 其余 ViT op 单独汇总；`H3.video_vae.decode` 父区间中不属于 42 个 ViT 子区间的 wrapper 再单独汇总。
+
+最终使用的合并逻辑：
+
+```python
+vit = groups['H3.video_vae.all_vit']
+wrapper = groups['H3.video_vae.decode']
+# 先在 vit 内分类，再单独计算 vit_other 和 wrapper，避免按名字跨区间误归。
+assert sum(r['count'] for r in vit if r['kernel'].startswith('void cutlass::Kernel2')) == 6048
+assert sum(r['total_ns'] for r in vit if r['kernel'].startswith('void cutlass::Kernel2')) == 1130605806
+```
+
+过程中曾用“名字是否出现在 wrapper”判断外层 op，但 ViT 内也有相同的 copy/elementwise kernel 名称，会错误归到外层。该结果已弃用，改为严格按 `range_group` 先拆分再合并。最终验证：
+
+```text
+完整视频解码：29,339 kernels，2,123.436509 ms。
+Other ViT：9,216 kernels，64.093625 ms。
+ViT wrapper：1,979 kernels，10.227777 ms。
+```
+
+最终表格：
+
+| 类别 | 次数 | GPU work | 占比 |
+|---|---:|---:|---:|
+| INT8 GEMM | 6048 | 1130.605806 ms | 53.2442% |
+| ConvRot | 6048 | 316.196056 ms | 14.8908% |
+| Sage attention | 1512 | 284.758450 ms | 13.4103% |
+| fused RMS+RoPE | 1512 | 188.217871 ms | 8.8638% |
+| attention QKV quant | 3024 | 129.336924 ms | 6.0909% |
+| 其他 ViT op | 9216 | 64.093625 ms | 3.0184% |
+| ViT wrapper | 1979 | 10.227777 ms | 0.4817% |
+
+次数与 GPU work 加总均严格等于完整视频解码。`to_out/ff.w2` residual 已在 INT8 GEMM epilogue 内，不另列，避免重复统计。
+
+## 55.4 音频 VAE 的 kernel work 构成
+
+分类规则：
+
+- ConvTranspose1d 前向：`dgrad2d_grouped_direct_kernel`。
+- Depthwise：`conv_depthwise2d_forward_kernel`。
+- 其它 Conv/GEMM：名称包含 `implicit_convolve_sgemm`、`implicit_gemm`、`dgrad_engine`、`xmma_fprop`、`cutlass__5x_cudnn`、`cutlass::Kernel2`。
+- padding：`replication_pad_forward_kernel1d`。
+- layout：`nchwToNhwcKernel` 或 `nhwcToNchwKernel`。
+- Snake 超越函数：`sin_kernel`、`exp_kernel`、`reciprocal_kernel`。
+- 剩余为 pointwise/residual/copy。
+
+结果：
+
+| 类别 | 次数 | GPU work | 占比 |
+|---|---:|---:|---:|
+| ConvTranspose1d 前向 | 127 | 11.756711 ms | 34.2879% |
+| Depthwise conv | 127 | 3.626873 ms | 10.5776% |
+| 其它 Conv/GEMM | 136 | 4.176538 ms | 12.1807% |
+| Padding | 254 | 3.436250 ms | 10.0217% |
+| Layout conversion | 286 | 1.671486 ms | 4.8748% |
+| Snake sin/exp/reciprocal | 508 | 1.460029 ms | 4.2581% |
+| 其他 pointwise/residual/copy | 1241 | 8.160378 ms | 23.7993% |
+| 合计 | 2679 | 34.288265 ms | 100% |
+
+演示中保留重要边界：`dgrad` 是 BigVGAN ConvTranspose1d 的前向实现，不是训练 backward；音频 VAE 没有 INT8/NVFP4 kernel。
+
+## 55.5 INT8 ConvRot 反量化误差明细
+
+在 `presentation.md` 4.3 新增 `Detail：int8_convrot 的反量化误差分析`，加入来源链接：
+
+- `minimax_h3_comfyorg_files_analysis.md#L195`：INT8/ConvRot 的 256 组 Hadamard 和 per-channel FP32 scale。
+- `run_book_quant.md#L250`：实际反量化与 BF16 base 对照。
+
+展示公式：
+
+```text
+rel_RMSE = ||W_dequant - W_bf16||₂ / ||W_bf16||₂
+cosine   = <W_dequant, W_bf16> / (||W_dequant||₂ × ||W_bf16||₂)
+```
+
+四层表格逐项使用 `run_book_quant` 的实测值：
+
+| 模块 | INT8 rel_RMSE | cosine(float64) | MXFP8 rel_RMSE |
+|---|---:|---:|---:|
+| blocks.0.attn.qkv_proj | 0.8985% | 0.999960 | 2.6606% |
+| blocks.0.attn.out_proj | 1.2113% | 0.999927 | 2.6611% |
+| blocks.0.mlp.fc1 | 0.8973% | 0.999960 | 2.6608% |
+| blocks.49.mlp.fc2 | 0.9640% | 0.999954 | 2.6620% |
+
+保留解释：INT8 的 per-channel FP32 scale + ConvRot 与 MXFP8 的 E4M3 mantissa 差异能够解释这组权重误差；但这些误差不代表端到端画质、速度或数值稳定性，仍需完整 workflow 验证。
+
+## 55.6 最终文档与一致性检查
+
+第三节现在依次为：
+
+- 3.3 DiT kernel work；
+- 3.4 Qwen kernel work；
+- 3.5 视频 VAE kernel work；
+- 3.6 音频 VAE kernel work；
+- 3.7 视频 VAE tile/chunk/fusion；
+- 3.8 实测对后续设计的约束。
+
+4.3 新增 INT8 误差表和来源链接。所有表格都沿用 kernel work，不将其写成 wall-time。
+
+最终验证脚本执行了以下断言：
+
+1. 3.1–3.8 标题各出现一次，代码围栏成对。
+2. Qwen 的 350 次 FP32 GEMM、350 次 dequant、50 次 attention 和总 GPU work 与原始 CSV 一致。
+3. 视频完整解码为 29,339 个 kernel、2,123.436509 ms；INT8 GEMM 为 6048 次、1,130.605806 ms；ConvRot 为 316.196056 ms；Sage 为 284.758450 ms。
+4. 音频为 2679 个 kernel、34.288265 ms；最大 ConvTranspose 项为 11.756711 ms。
+5. 四层 INT8/MXFP8 误差值逐项出现在 4.3 的 Detail 区域。
+6. 全部 12 个本地文档/媒体链接的目标存在。
+
+实际输出：
+
+```text
+presentation_new_kernel_tables_and_int8_error_table_ok
+lines: 398 bytes: 23443 links: 12
+```
+
+本轮仅更新 `presentation.md` 和追加本记录，没有修改 ComfyUI 源码或重新运行 GPU 推理。
