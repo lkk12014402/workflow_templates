@@ -4384,3 +4384,849 @@ lines: 398 bytes: 23443 links: 12
 ```
 
 本轮仅更新 `presentation.md` 和追加本记录，没有修改 ComfyUI 源码或重新运行 GPU 推理。
+
+
+### 55.7 用户追问：视频 VAE 为什么没有 kernel 构成
+
+用户追问后，重新读取 `presentation.md:174-213` 核对。视频 VAE 的 kernel 构成**已经存在**，位于 `presentation.md:179` 的 **3.5 视频 VAE：kernel work 的构成**，不是只有后面的 3.7 tile/chunk 小节。
+
+该表包含完整视频解码的 29,339 个 kernel、2,123.437 ms GPU work，以及 INT8 GEMM 6048 次/53.24%、ConvRot 6048 次/14.89%、Sage INT8 attention 1512 次/13.41%、fused RMS+RoPE 1512 次/8.86%、Q/K/V 量化 3024 次/6.09%、其他 ViT op 和 wrapper。无需再修改文档；回复用户准确小节位置，若页面未显示则可能是修改前版本。
+
+
+---
+
+# MXFP8/MXFP4 Proposal 实施：源码、环境与第一轮预检
+
+## 56. 任务与实施边界
+
+用户批准按 `comfyui_h3_mxfp8_mxfp4_proposal.md` 开始实现，要求代码风格良好、可扩展，并借鉴 vLLM、FlashInfer 和 Comfy-Kitchen 的设计。可用验证模型：
+
+- DiT：`ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_mxfp8.safetensors`。
+- Qwen：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc/`。
+
+当前目标是 B200 dense W8A8/W4A4 的真实 GEMM、原生加载、可插拔 backend 和逐层/端到端验证。原 8188 服务和原 `.venv` 不修改，测试使用当前空闲的 GPU 1。
+
+本轮没有声称完整目标已经跑通。以下记录区分源码完成、静态检查、正在运行和已失败/已修正的预检。
+
+## 56.1 源码工作区和模型格式
+
+ComfyUI 保持 commit `989d93d0d968e704c589ce0146bb18c77f6b50cc`。
+
+Comfy-Kitchen 按当前安装版本 clone 到本地：
+
+```bash
+git ls-remote https://github.com/Comfy-Org/comfy-kitchen.git \
+  HEAD refs/tags/v0.2.41 refs/tags/0.2.41
+git clone --depth 1 --branch v0.2.41 \
+  https://github.com/Comfy-Org/comfy-kitchen.git \
+  /home/kaokaolv/comfyui_h3/comfy-kitchen
+```
+
+固定 tag 为 `cbc44a5b7cc3b8f910ef76ae5251c94971eb05d1`，`pyproject.toml` 版本也是 0.2.41。仓库没有自己的 AGENTS.md，使用项目根和 ComfyUI 的工程约束。
+
+模型检查：
+
+- Qwen 目录含单文件 `model.safetensors`，14,945,516,464 B、1253 tensors。
+- `weight_packed` 共 350 个；`weight_scale` 共 351 个（含 embedding）。
+- `model.language_model.layers.0.self_attn.q_proj.weight_packed` 为 U8 `[8192,2560]`，scale 为 U8 `[8192,160]`，即 K=5120、group 32。
+- config 为 compressed-tensors mixed-precision：Linear `mxfp4-pack-quantized`，embedding `mxfp8-quantized`，均 group 32；key 为 HF 风格，不能直接当成现有 ComfyUI 原生 key。
+- DiT MXFP8 已是原生 `.comfy_quant` 单文件。
+
+环境现状：原 ComfyUI `.venv` 没有 FlashInfer/CuTe-DSL；独立 vLLM 环境有 FlashInfer 0.6.18、nvidia-cutlass-dsl 4.6.2、cuda-python 13.4.1。GPU 0 正被其它任务使用，GPU 4–7 也有大量占用；GPU 1/3 当时空闲，选择 GPU 1。
+
+## 56.2 独立环境与依赖
+
+创建独立 `.venv-mxfp`，不通过 PYTHONPATH 混用原 ComfyUI 和 vLLM 的包：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+export UV_CACHE_DIR=/home/kaokaolv/comfyui_h3/.uv-cache
+uv venv --python /home/kaokaolv/comfyui_h3/.venv/bin/python \
+  /home/kaokaolv/comfyui_h3/.venv-mxfp
+uv pip install --python /home/kaokaolv/comfyui_h3/.venv-mxfp/bin/python \
+  --torch-backend=cu130 \
+  -r /home/kaokaolv/comfyui_h3/ComfyUI/requirements.txt \
+  torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
+  huggingface_hub==1.32.0 'flashinfer-python[cu13]==0.6.18'
+uv pip install --python /home/kaokaolv/comfyui_h3/.venv-mxfp/bin/python \
+  --no-build-isolation --no-deps -e /home/kaokaolv/comfyui_h3/comfy-kitchen
+```
+
+后台 task：`bash-0je63sk4`。依赖解析成功，但 FlashInfer 17.5 MiB 下载/文件系统等待长时间没有完成，不能标记环境 ready。
+
+## 56.3 第一轮实现内容
+
+### Comfy-Kitchen
+
+- 新增 `backends/cuda/mx_linear.py`：
+  - `MXLinearConfig`（format/N/K/out_dtype/activation/scale layout）。
+  - `MXLinearKernel` 和 FlashInfer CUTLASS/CuTe-DSL 候选。
+  - `is_supported(device)` 检查实际 device 和依赖；`can_implement(config)` 检查 N/K、输出 dtype 和格式。
+  - `register_mx_linear_kernel` 支持后续扩展。
+  - `COMFY_KITCHEN_MX_LINEAR_BACKEND` 和 `COMFY_KITCHEN_DISABLED_MX_KERNELS` 控制候选。
+  - 缺失 backend 通过 `NoCapableBackendError` 报告原因，选中后的运行错误不再静默降级。
+- 新增 `tensor/mxfp4.py`：逻辑 shape/packed storage shape、transpose、linear/mm/addmm、序列化和反量化。
+- `tensor/mxfp8.py` 移除合法 fast path 上的异常后静默 dequantize fallback。
+- `backends/eager/quantization.py` 新增 MXFP4 E2M1、E8M0 group-32、128x4 scale、反量化 FP32 reference 和 custom-op fake/meta。
+- 公共 `__init__.py` 增加 `quantize_mxfp4/dequantize_mxfp4/scaled_mm_mxfp4`，CUDA 注册增加 MXFP8 scaled_mm 和 MXFP4 全链。
+- `eager_reference` 显式走 reference；`torch_scaled_mm_v2` 仅作为显式 MXFP8 待验证路径，不与真 FlashInfer backend 混称。
+- 新增 `tests/test_mxfp.py`：精确 E2M1 值、padding、reference Linear、FP32 拒绝、无静默 fallback、FlashInfer 真 Linear。
+
+### ComfyUI
+
+- `comfy/quant_ops.py` 注册 `TensorCoreMXFP4Layout` 和 `QUANT_ALGOS["mxfp4"]`；FP32 activation 明确转 BF16 后再量化，未实现 stochastic rounding 时明确报错。
+- `comfy/ops.py`：
+  - MXFP8/MXFP4 的 `weight_scale` 以 E8M0 view 读取，验证 group 32、128x4 和 packed storage shape。
+  - 只对 MXFP8/MXFP4 让显式 `full_precision_matrix_mult` 覆盖父级文本编码器默认；旧格式分支不变。
+  - 保存时写出 full-precision flag、group size 和 scale layout，避免 roundtrip 丢失策略。
+- 新增 `tests/inference/test_mxfp_quant.py`：动态构造小 checkpoint，验证加载、forward、保存和错误 scale layout 拒绝。
+
+### compressed-tensors 转换工具
+
+新增 `convert_h3_compressed_mx.py`：
+
+- HF key 映射：`model.language_model.layers.* → model.layers.*`、`model.language_model.embed_tokens → model.embed_tokens`、`model.visual.* → visual.*`。
+- `weight_packed → weight`，不重新量化。
+- 两遍 safetensors 处理：先计算新 header 和所有 offset，再流式拷贝原始 payload；只把较小的 scale 做 128x4 重排，新增 `.comfy_quant`。
+- 保留 visual/non-target tensor、metadata 和 tokenizer 不在模型权重文件内处理。
+- 支持 `--dry-run` 和 `--only <module>`，先用一个 q_proj 验证，避免未验证就重写完整 15GB。
+- 目标文件采用临时文件写完后 `os.replace`，已存在文件需要显式 `--overwrite`。
+
+### 小矩阵验证工具
+
+新增 `validate_h3_mxfp_kernels.py`，分别验证：
+
+- `mm_mxfp8(backend="cutlass")`。
+- `mm_mxfp8(backend="cute-dsl")`。
+- `mm_fp4(block_size=32,use_nvfp4=False,backend="cute-dsl")`。
+
+独立 Python 反量化后 FP32 GEMM 作 reference，检查 shape、dtype 和 rel_rmse，不使用原始未量化输入代替量化 reference。
+
+## 56.4 首次预检失败与 Ninja 修复
+
+第一次运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+/home/kaokaolv/.venv-vllmomni029/bin/python -u \
+  /home/kaokaolv/comfyui_h3/validate_h3_mxfp_kernels.py \
+  > /home/kaokaolv/comfyui_h3/logs/mxfp_p0.log 2>&1
+```
+
+实际先打印 B200，随后 `mxfp8-cutlass` 在 FlashInfer JIT 阶段失败：
+
+```text
+FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+```
+
+这不是数值错误或 kernel 不支持，而是 JIT 缺少 Ninja 可执行文件。
+
+随后 `uv pip install --target .mxfp_tools ninja` 也超时，改用 Ninja 官方独立二进制：
+
+```bash
+mkdir -p /home/kaokaolv/comfyui_h3/.mxfp_tools
+curl --fail --location --max-time 120 --retry 2 \
+  https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-linux.zip \
+  -o /home/kaokaolv/comfyui_h3/.mxfp_tools/ninja-linux.zip
+```
+
+用 Python `zipfile` 解压。第一次目标名 `.mxfp_tools/ninja` 与 pip 的 Python 包目录冲突，报 `IsADirectoryError`；改为 `.mxfp_tools/ninja-bin`，再复制为 `.mxfp_bin/ninja`，`ninja --version` 实测为 **1.13.2**。
+
+重试命令：
+
+```bash
+PATH=/home/kaokaolv/comfyui_h3/.mxfp_bin:$PATH \
+CUDA_VISIBLE_DEVICES=1 \
+/home/kaokaolv/.venv-vllmomni029/bin/python -u \
+  /home/kaokaolv/comfyui_h3/validate_h3_mxfp_kernels.py \
+  > /home/kaokaolv/comfyui_h3/logs/mxfp_p0_retry.log 2>&1
+```
+
+后台 task：`bash-szqrnnsq`。截至本记录时仍未产生最终 kernel 结果，不能把 Ninja 修复写成预检通过。
+
+## 56.5 静态检查和运行中测试
+
+已对新增/修改 Python 文件执行 `ast.parse`，8 个首轮文件和后续 ComfyUI/转换器文件均通过。
+
+执行了：
+
+```bash
+CUDA_VISIBLE_DEVICES='' \
+PYTHONPATH=/home/kaokaolv/comfyui_h3/comfy-kitchen \
+/home/kaokaolv/.venv-vllmomni029/bin/python -m pytest \
+  /home/kaokaolv/comfyui_h3/comfy-kitchen/tests/test_mxfp.py \
+  -k 'not flashinfer' -q
+```
+
+后台 task：`bash-w0rytbnm`，受共享文件系统/import 等待影响超时，没有得到 pytest 通过结果。
+
+转换器初次 dry-run 发现 `source_entries.append` 少一个右括号，已修正。随后启动完整转换计划 dry-run（task `bash-epg0t0mp`）和单个 q_proj 转换（task `bash-4koj1vl9`），结果待取得。
+
+`git diff --check` 没有发现空白错误。`ruff` 在参考环境中未找到可执行文件，未声称完成 ruff 检查。
+
+## 56.6 当前状态
+
+**已完成源码第一轮**：MXFP4 layout/eager reference、MXFP8/MXFP4 公共接口、FlashInfer 候选选择、ComfyUI 加载策略、转换器和测试文件。
+
+**已修正的实际错误**：首次 JIT 缺 Ninja、Ninja 解压目标与包目录重名、转换器一个语法错误。
+
+**仍待完成**：环境安装完成、FlashInfer 三项真实 kernel 预检、CPU/GPU pytest、单层转换/加载验证、DiT/Qwen 实际推理和完整 T2V/CUPTI/显存对照。
+
+共享文件系统的 page fault 和包下载是当前主要等待原因，不是可以宣称“模型不支持”或“实现已跑通”的证据。后续仍以真实日志、pytest 和 CUPTI 为准。
+
+
+### 56.7 单元测试通过、转换器根因修复与 CUDA 构建推进
+
+#### Python/custom-op 测试修正
+
+- `dequantize_mxfp4/scaled_mm_mxfp4` custom-op 补齐参数和返回值类型标注，修复 `infer_schema` 的参数与 return annotation 错误。
+- `_f32_to_floatx_unpacked` 在 `[R,K/32,32]` 上打包后得到 `[R,K/32,16]`，已 reshape 为 `[R,K/2]`，修复 qdata shape。
+- 显式 `eager_reference` 的 MXFP8 改为 dequantize + FP32 matmul，不再调用 CPU 不支持 swizzle 的 `scaled_mm_v2`；`torch_scaled_mm_v2` 仍保留为独立待验证路径。
+- 已安装 `nanobind`、`pytest`、`ruff` 和 `cmake`。新增代码已按 Ruff 做 import 修复和格式化。
+
+实际通过：
+
+```text
+comfy-kitchen/tests/test_mxfp.py -k 'not flashinfer':
+  6 passed, 4 deselected
+ComfyUI/tests/inference/test_mxfp_quant.py:
+  2 passed
+```
+
+执行环境为 `.venv-mxfp` 与本地 `comfy-kitchen` 源码，GPU 1 提供 ComfyUI 初始化需要的 CUDA device，CPU reference 不依赖 GPU kernel。
+
+#### 转换器调试与最终单层验证
+
+转换器依次发现并修正：
+
+1. `source_entries.append` 的语法括号错误。
+2. 175 个 visual bias 被漏掉，完整保留非量化 tensor 后全量 dry-run 为 1604 个输出 tensor。
+3. `output_entries` 未携带 `is_scale`，writer 循环误用上一个源 entry 的值，导致 qdata 也进入 scale 重排。已把 `is_scale` 显式加入每个 entry，并同步修改 writer/header 解包。
+4. 只有 `weight_scale` 可以重排；`weight_packed` 必须 raw-copy。
+5. 用 `output_entries == source_entries + layers` 断言每个量化模块恰好一个 scale 和一个 `.comfy_quant`。
+
+停止了生成无效大文件的旧转换任务 `bash-gx311mwi`，删除其临时文件，没有用于模型加载。最终有效文件：
+
+```text
+/home/kaokaolv/comfyui_h3/.tmp/qwen_qproj_mxfp4_comfy_v5.safetensors
+3 tensors（weight/weight_scale/comfy_quant）
+22,283,086 B
+```
+
+逐字节验证通过：源 `weight_packed == 目标 weight`；目标 scale == 源 scale 的 128x4 重排；`.comfy_quant` 为 `format=mxfp4`、`full_precision_matrix_mult=false`。
+
+真实 ComfyUI loader 验证时，第一次直接加载整层 key 导致 `Missing weight`，原因是测试没有提供 `model.layers.0.self_attn.q_proj.` 前缀，并非转换 key 错误。按实际 loader 的 prefix 去掉该前缀后：
+
+```text
+real_qproj_comfy_loader_forward_ok torch.Size([3, 8192]) torch.bfloat16
+```
+
+#### CUDA 依赖和编译器匹配
+
+环境安装：
+
+- 119 个基础包成功安装，包含 `flashinfer-python==0.6.18` 和 PyTorch 2.13.0+cu130。
+- editable 构建最初因缺 `nanobind` 失败；补齐后又缺 `cmake`，已安装 `cmake==4.4.5`。
+- 预检第一次缺 `ninja`，用官方独立二进制 1.13.2 解决。
+- 随后系统默认 `/usr/bin/nvcc` 为 CUDA 12.0，不能处理 FlashInfer 编译参数；已有 `nvidia/cu13/bin/nvcc` 是 13.4.92，但其原有 `nvidia/cu13/include` 是 CUDA 13.2，触发 CCCL 的 compiler/header mismatch。
+- `nvidia-cuda-runtime-cu13` 是占位包，不能用于安装。正确包名为 `nvidia-cuda-runtime`，索引确认并实际安装了 **13.4.92**，与 nvcc 一致。
+- 使用 `NVCC_PREPEND_FLAGS=-I.../nvidia/cuda_runtime/include` 让编译器优先使用匹配的 13.4 头文件，同时把 `nvidia/cu13/bin` 加入 PATH，避免 setup.py 再退回系统 CUDA 12.0。
+
+当前后台任务：
+
+- `bash-tgryfsks`：以匹配的 nvcc/runtime 构建本地 Comfy-Kitchen editable。
+- `bash-h6z3vtdq`：以匹配的 nvcc/runtime 运行 MXFP8 CUTLASS/CuTe-DSL 和 MXFP4 CuTe-DSL 三项小矩阵预检。
+
+这两项仍待真实成功结果，当前只能宣称 Python/reference/loader/二进制转换已验证，不能宣称 MXFP GEMM 或完整环境已通过。
+
+
+### 56.8 真实 MXFP kernel、模型权重与完整 Qwen 转换通过
+
+#### 三项 B200 kernel 预检已通过
+
+使用 `.venv-mxfp`、本地 `comfy-kitchen`、官方 `flashinfer-jit-cache==0.6.18+cu130`，实际执行 `validate_h3_mxfp_kernels.py`，日志 `logs/mxfp_p0_prebuilt.log`：
+
+```text
+mxfp8-cutlass:  shape [128,256], BF16, rel_rmse 0.0016588261
+mxfp8-cute-dsl: shape [128,256], BF16, rel_rmse 0.0016588261
+mxfp4-cute-dsl: shape [128,256], BF16, rel_rmse 0.0016065878
+```
+
+reference 是独立反量化后的 FP32 GEMM，不是未量化输入。MXFP4 CuTe-DSL 首次编译成功并持久化到 cache。
+
+同版本 `_C.abi3.so` 被链接到本地源码树作为测试构建产物；C++ 源未改，原 wheel 与 clone 都是 v0.2.41 tag。该链接不是源码修改，避免把无关的完整 C++ 构建问题混入 MX Python 验证。
+
+#### layout、回归和真实 DiT 权重
+
+- `tests/test_mxfp.py`：**10 passed**。测试调整为在 CUDA 上临时清空 kernel 候选列表，精确验证 backend 缺失会报 `NoCapableBackendError`，而不是在有可用 backend 时错误地期待失败。
+- 既有 `test_backends.py + test_int8.py + test_fp16_linear.py`：**160 passed**，确认 MX 改动没有破坏原 INT8/backend/FP16 路径。
+- 真实 `blocks.0.attn.qkv_proj`：
+  - M=128：输出 `[128,21504]`，rel_rmse `3.73219e-06`。
+  - 实际 prompt M=15787：输出 `[15787,21504]`，rel_rmse `7.68573e-06`。
+- 日志明确显示 backend 为 BF16 和 `flashinfer_cutedsl`。
+
+#### 完整 Qwen 原生 MXFP4 文件与真实加载
+
+完整转换任务 `bash-5coy66jx` 成功，产物：
+
+```text
+ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4.safetensors
+14,945,687,993 B
+1604 tensors；351 个量化模块（350 MXFP4 Linear + 1 MXFP8 embedding）
+```
+
+header 检查通过：350 个目标 Linear、embedding、visual bias 和非量化 tensor 均保留。没有重新量化。
+
+`validate_h3_te_mxfp4.py` 初次发现测试工具把 packed K=2560 当作逻辑 K，已恢复为逻辑 K=5120。真实 `model.layers.0.self_attn.q_proj` 的 ComfyUI 加载和 forward 通过：
+
+```text
+shape [128,8192], BF16, rel_rmse 0.0, max_abs 0.0
+weight storage [8192,2560]，scale [8192,160]
+```
+
+这同时验证了 packed shape、Qwen 默认 full-precision 覆盖、真实 MXFP4 GEMM 和与 reference 的一致性。
+
+#### 端到端任务已启动
+
+- `bash-oy2oyhq4`：8190 独立 MXFP 服务，使用 `.venv-mxfp`、GPU 1，原 8188 未停止。
+- `bash-pmcdnqp4`：DiT MXFP8 + 原 NVFP4 TE 的完整 T2V，prompt `e25d5029-272e-4a45-9741-925481ab54c5`。服务日志已确认加载 MXFP8 DiT、进入 20 steps 并选择 `flashinfer_cutedsl`。
+- `bash-hx23fv26`：Qwen MXFP4 + 原 INT8 DiT 的完整 T2V，在同一服务串行执行。
+
+端到端脚本初次读取 API JSON 时少了顶层 `["prompt"]`，已修正；真正的 prompt 已提交。CUPTI 脚本 `run_h3_cupti.py` 已增加 `--dit/--clip/--out-dir` 参数，准备后续采集两种格式同时启用的真实 kernel。
+
+这些结果不等于完整 T2V 已验收，媒体和全链路 CUPTI 仍待完成。
+
+
+## 57. 端到端 MXFP 验收、结果收集修复与双格式 CUPTI
+
+### 57.1 DiT MXFP8 的“失败”实际是 MP4 收集条件错误
+
+后台任务 `bash-pmcdnqp4` 返回非零后，先读取 `logs/mxfp_dit_t2v.log` 和 `logs/comfyui_mxfp_8190.log`，没有假设是推理错误。服务端证据为：
+
+- prompt `e25d5029-272e-4a45-9741-925481ab54c5`；
+- 实际选择 `Using flashinfer_cutedsl for mxfp8 GEMM on cuda:0`；
+- 20 步全部完成，首步 175.35 s，后续约 1.43 s/step；
+- 音频、视频 VAE 均完成，`Prompt executed in 382.81 seconds`；
+- history 中有 `video/MiniMax_H3_00009_.mp4`。
+
+客户端却执行 `raise RuntimeError(json.dumps(outputs, indent=2))`。根因在 `run_h3_mxfp_workflow.py`：它只收集 `node_output["videos"]`，而当前 ComfyUI `SaveVideo` 把 MP4 放在 `images`，通过 `metadata.kind == "video"` 标识，所以已有视频被误判为没有输出。未重新执行模型。
+
+修复：兼容 `videos` 与带视频 metadata 的 `images`；新增 `--prompt-id` 直接复用 history。复用时 `history_reused=true`、`elapsed_seconds=null`，避免把仅收集结果的耗时误报为推理耗时。视频解码检查仍要求 H.264、864x480、24 fps、124 帧、32 kHz 双声道 AAC。
+
+实际复用命令：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+CUDA_VISIBLE_DEVICES=1 .venv-mxfp/bin/python -u run_h3_mxfp_workflow.py \
+  --port 8190 --label dit_mxfp8_te_nvfp4 \
+  --prompt-id e25d5029-272e-4a45-9741-925481ab54c5 \
+  > logs/mxfp_dit_collect.log 2>&1
+```
+
+结果 `logs/mxfp_runs/dit_mxfp8_te_nvfp4/run_result.json`：`status_str=success`、`completed=true`，上述所有媒体条件及全帧解码通过，文件为 `ComfyUI/output/video/MiniMax_H3_00009_.mp4`。
+
+### 57.2 Qwen MXFP4 同样完成，复用 history 验收
+
+`bash-hx23fv26` 也返回相同的“无 videos 输出”异常，而不是 GEMM 异常。prompt 为 `2a60a094-bdb6-4290-8f1f-474a2a8f8bb8`；服务日志已明确选择 `Using flashinfer_cutedsl for mxfp4 GEMM on cuda:0`，history 中有 `video/MiniMax_H3_00010_.mp4`。
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+CUDA_VISIBLE_DEVICES=1 .venv-mxfp/bin/python -u run_h3_mxfp_workflow.py \
+  --port 8190 --label te_mxfp4_dit_int8 \
+  --prompt-id 2a60a094-bdb6-4290-8f1f-474a2a8f8bb8 \
+  > logs/mxfp_te_collect.log 2>&1
+```
+
+`logs/mxfp_runs/te_mxfp4_dit_int8/run_result.json` 验证成功：H.264、864x480、24 fps、124 帧、AAC 32 kHz 双声道，全部音视频 packet 均可解码。history execution timestamps 给出端到端约 316.502 s。8190 服务没有 OOM、kernel exception 或 execution error。
+
+补充：修改 runner 期间读取仍在输出的 traceback 时，Python `linecache` 可能把旧栈帧行号映射到新源码，因此以 history 的 status/outputs 和服务端日志为事实依据，没有用错位的源码行推断新的模型问题。
+
+### 57.3 工具检查的真实结果与依赖状态
+
+`run_h3_cupti.py` 原有的 import 排序、shebang 可执行位和宽泛 `except Exception` 未通过本环境 Ruff 全规则。已设置可执行位、整理 import，并把 profiler stop 的异常限定为 `OSError/http.client.HTTPException/RuntimeError/json.JSONDecodeError`。`ruff format` 后，两个 runner 的 `ruff check` 和 `ruff format --check` 通过。中间 lint 失败发生在命令链的 `&&` 前端，未误记为模型执行。
+
+新 MX kernel/layout/test 文件的 Ruff check 全通过；`mxfp8.py` 经 Ruff 格式化后四个文件均通过 `ruff format --check`，没有数值逻辑变化。两个仓库的 `git diff --check` 均通过。
+
+`bash-y8frfxar` 日志确认 `flashinfer-jit-cache==0.6.18+cu130` 已安装；`flashinfer-cubin==1.5 GiB` 下载完成并在 prepare 后遇到后台 1200 s 时限。当前真实 MXFP8/MXFP4 GEMM 使用已安装的 JIT-cache 和 CuTe-DSL，不依赖该 cubin 安装任务，未把超时解释为 kernel 不可用。
+
+### 57.4 双格式同时启用的 Nsight 采集
+
+使用 `which nsys && nsys --version` 确认 `/usr/local/bin/nsys`，版本 `2024.6.2.225-246235244400v0`。首次启动 8191（task `bash-bwde01ks`）时漏传 `PYTHONPATH/CUDA_VISIBLE_DEVICES`，日志显示八张 GPU 且旧 Kitchen 缺少 MXFP4。由于尚未提交 prompt，只停止该 8191 task；8188、8190 均未停止。这个启动结果不作为 trace 证据。
+
+纠正后的完整启动命令（task `bash-l216xb9w`）：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+env VIRTUAL_ENV=/home/kaokaolv/comfyui_h3/.venv-mxfp \
+  PATH=/home/kaokaolv/comfyui_h3/.venv-mxfp/bin:/usr/local/bin:/usr/bin:/bin \
+  PYTHONPATH=/home/kaokaolv/comfyui_h3/comfy-kitchen \
+  CUDA_VISIBLE_DEVICES=1 \
+  TMPDIR=/home/kaokaolv/comfyui_h3/.tmp \
+  XDG_CACHE_HOME=/home/kaokaolv/comfyui_h3/.cache \
+  HF_HOME=/home/kaokaolv/comfyui_h3/.cache/huggingface \
+  nsys profile --trace=cuda,nvtx \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --cuda-graph-trace=node --export=sqlite \
+  -o /home/kaokaolv/comfyui_h3/logs/mxfp_cupti/both/h3_both \
+  /home/kaokaolv/comfyui_h3/.venv-mxfp/bin/python ComfyUI/main.py \
+  --listen 0.0.0.0 --port 8191 --disable-partner-nodes \
+  > logs/mxfp_cupti_both_server.log 2>&1
+```
+
+启动后复查日志，只看到 `Device: cuda:0 NVIDIA B200`，且 `scaled_mm_mxfp4/scaled_mm_mxfp8` 均注册，才提交任务。
+
+采集驱动 task `bash-q269h3ik` 复用现有 `h3_batch_runner.Monitor` 每 0.5 s 采样 `/h3/memory`、执行节点与 WebSocket 事件，并调用 `/h3/memory/reset`。显存 NVML 是整张物理 GPU 1 的值，包含仍在运行的 8190 服务；PyTorch allocated/reserved peak 则是 8191 进程独立数据，比较时不混用。驱动实际设置：
+
+```python
+batch.HOST = "127.0.0.1"
+batch.PORT = 8191
+batch.GPU_ID = 1
+batch.request("POST", "/free", {"unload_models": True, "free_memory": True})
+baseline = batch.request("POST", "/h3/memory/reset", {})
+monitor = batch.Monitor(Path("logs/mxfp_cupti/both"), "h3-cupti")
+monitor.start()
+sys.argv = [
+    "run_h3_cupti.py", "--port", "8191",
+    "--dit", "minimax_h3_fl2va_pruned_mxfp8.safetensors",
+    "--clip", "qwen3vl_32b_minimax_h3_mxfp4.safetensors",
+    "--trace-base", "/home/kaokaolv/comfyui_h3/logs/mxfp_cupti/both/h3_both",
+    "--out-dir", "/home/kaokaolv/comfyui_h3/logs/mxfp_cupti/both",
+]
+runpy.run_path("/home/kaokaolv/comfyui_h3/run_h3_cupti.py", run_name="__main__")
+# finally: monitor.stop()
+```
+
+完整驱动命令与环境在后台 task `bash-q269h3ik`，stdout/stderr 为 `logs/mxfp_cupti_both_run.log`。服务端已确认收到 prompt 并选择 MXFP4 CuTe-DSL。双格式 DiT/CUPTI、媒体、trace 解析和显存对照结果待采集结束后填写，当前不提前宣称全链路通过。
+
+
+### 57.5 转换器全量逐 tensor 校验通过
+
+为排除“只对了一个 q_proj、其他层转换错位”的可能，执行只读全量检查（后台 task `bash-dgw34ca1`，完整命令为其 here-doc，输出 `logs/mxfp_conversion_verify.log/json`）：
+
+- 源：`qwen3vl_32b_minimax_h3_mxfp4_llmc/model.safetensors`，1253 个数据 tensor；
+- 目标：`qwen3vl_32b_minimax_h3_mxfp4.safetensors`，1604 个数据 tensor；
+- 902 个 raw-copy tensor 的 SHA-256 全部一致，共 14,159,191,520 B；
+- 351 个 scale 按独立实现的 128x4 重排后逐 byte 一致，共 786,165,760 B；
+- 351 个 `.comfy_quant` 与顶层 `_quantization_metadata.layers` 逐条一致；
+- 目标 1604 个 tensor 全覆盖，没有遗漏 visual bias、norm 或其他 BF16 tensor。
+
+校验使用 Python 流式 8 MiB read/hash，未同时物化两个 15 GB 文件。结论仅限于转换忠实搬运 qdata、重排 scale 和生成 metadata；**不能由此推断 RTN MXFP4 权重的端到端精度足够**。
+
+### 57.6 三路视频对照与需要继续追查的 MXFP4 语义偏差
+
+使用同一 `api_prompt.json` 的原始输出、DiT MXFP8、TE MXFP4 做媒体验证和同帧对照。命令为调用现有 `h3_batch_runner.validate_media` 的 Python here-doc，完整输出见 `logs/mxfp_media_comparison.log`、`logs/mxfp_runs/media_comparison.json`；同帧图见 `logs/mxfp_runs/media_contact_sheet.png`。
+
+三者均通过 H.264、864x480、24 fps、124 帧、AAC 32 kHz 双声道和非空音视频检查：
+
+| 版本 | 输出 | 视频 std 范围 | 音频 max abs | 对原输出全局 RGB PSNR |
+|---|---|---|---:|---:|
+| 原 INT8 DiT + NVFP4 TE | `MiniMax_H3_00002_.mp4` | 34.070–55.471 | 0.64827 | — |
+| MXFP8 DiT + 原 NVFP4 TE | `MiniMax_H3_00009_.mp4` | 29.322–56.637 | 0.66796 | 15.683 dB |
+| MXFP4 TE + 原 INT8 DiT | `MiniMax_H3_00010_.mp4` | 41.184–44.034 | 0.09959 | 12.506 dB |
+
+实际查看同帧图：MXFP8 版本保留原基线的屋顶追逐、跳跃等构图；MXFP4 TE 版本却变成室内正式聚会，场景和 prompt 明显不一致。RGB PSNR 仅是编码后像素指标，**不是感知质量分数，也不能替代 conditioning/embedding 误差**。因此不能拿“有 MP4 且可解码”当作 MXFP4 质量通过。
+
+新增 `validate_h3_te_conditioning.py`，使用 ComfyUI 原生 `CLIPType.MINIMAX`、tokenizer、`load_clip` 和 `encode_from_tokens_scheduled`，对同一长 prompt 依次比较 BF16、原 NVFP4、MXFP4 W4A4、MXFP4 仅权重反量化（W4A16）。脚本不修改权重文件，在独立物理 GPU 3 上运行，避免干扰 GPU 1 的服务。首次启动在 Ruff import 排序处停止，没有执行模型；修复后任务为 `bash-n8qb7yvy`，日志 `logs/mxfp_te_conditioning.log`，结果待取得。
+
+### 57.7 双格式 profiling 的实际计算成功，SaveVideo/AAC 失败
+
+双格式 prompt `35a04219-f516-4a81-89b0-9c59128e553f` 明确完成：
+
+- Qwen MXFP4 CuTe-DSL；
+- DiT MXFP8 CuTe-DSL；
+- 20/20 steps，首步 180.78 s，后续约 1.40 s/step（ComfyUI 进度）；
+- 音频 VAE、视频 VAE。
+
+失败点为 `SaveVideo` 的 `avcodec_send_frame()` AAC error 22，不是 MX GEMM/OOM。再次以相同 prompt 提交（`8ef8520d-fddd-4b82-99b5-9c71b0630ff1`，task `bash-71k26rys`），history 显示其余节点全部 `execution_cached`，仅 0.85 s 后又出现相同 AAC 错误。因此不是一次性的 Nsight 编码抖动；但尚不能在没有张量检查的情况下断言是 NaN、音频 shape 还是编码器参数问题。
+
+`run_h3_cupti.py` 的 `success=false` 已如实保存在 `logs/mxfp_cupti/both/run_result.json`。不能将其写成完整媒体成功。CUPTI 的 capture start/stop 正常，SQLite 导出完成；`PRAGMA integrity_check` 为 `ok`，kernel 记录 101174 条。已停止 8191 task `bash-l216xb9w`，原 8188 和隔离 8190 保持运行。
+
+### 57.8 CUPTI 真实 MX kernel 与调用次数证据
+
+执行：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+.venv-mxfp/bin/python analyze_h3_cupti.py \
+  logs/mxfp_cupti/both/h3_both.sqlite \
+  --out logs/mxfp_cupti/both/analysis \
+  > logs/mxfp_cupti_both_analysis.log 2>&1
+```
+
+得到 154 个 distinct kernel、67 个 H3 NVTX range。关键记录：
+
+- `H3.dit.all_steps`：`Sm100BlockScaledPersistentDenseGemmKernel...MMAAtom_ThrID1` **4000 次**，即 200 次/step × 20；`comfy::quantize_mxfp8_kernel<__nv_bfloat16>` 同为 **4000 次**。
+- `H3.text.qwen`：`Sm100BlockScaledPersistentDenseGemmKernel...MMAAtom_ThrID2` **350 次**，与 50 层 × 7 个量化 Linear 完全对应；`tensorrt_llm::kernels::quantize_with_block_size<...,int32,...>` 同为 **350 次**。
+- Qwen range 内没有 350 次对应的普通 NVJET GEMM；真实 block-scaled kernel 与 activation 量化一一对应，不是逐层 dequantize + 普通 GEMM 冒充。
+- 两个 kernel 的 demangled 名称都是通用 block-scaled 模板；归属依据是 H3 phase、加载的格式、实际 backend 日志、各模块应调用数和 activation quantizer，不能仅靠名字中的“cutlass”推断格式。
+
+两侧均运行 PyTorch 2.13.0+cu130、ComfyUI 0.45.0、Comfy-Kitchen 0.2.41、B200。按 NVTX range wall time：
+
+| 项目 | 原 INT8/NVFP4 trace | MXFP8 DiT + MXFP4 TE trace |
+|---|---:|---:|
+| DiT 首步（含初始化） | 178.617 s | 180.772 s |
+| DiT 稳态平均/step | 1.1607 s | 0.9691 s |
+| Qwen prefill | 113.043 s | 116.780 s |
+| Refiner | 14.275 s | 14.248 s |
+| Audio VAE decode | 3.050 s | 3.526 s |
+| Video VAE decode | 25.427 s | 28.066 s |
+
+DiT 稳态 NVTX wall time 下降约 16.5%，这是当前机器同一 prompt 的单次测量，不作为通用性能承诺；冷启动包含 JIT、磁盘和共享文件系统影响。trace 文件 `logs/mxfp_cupti/both/h3_both.sqlite` 为 27,983,872 B，分析表在 `logs/mxfp_cupti/both/analysis/`。
+
+### 57.9 当前显存记录与边界
+
+双格式采集复用现有 Monitor，`logs/mxfp_cupti/both/memory_samples.json` 共 627 个有效采样、0 个错误。8191 进程：
+
+- `max_allocated=3,120,901,740 B`，`max_reserved=3,154,116,608 B`；
+- DiT model size 21,557,467,480 B；原 INT8 DiT 为 20,967,535,680 B；
+- Qwen model size 14,921,082,174 B；原 NVFP4 TE 为 15,686,911,147 B；
+- 视频/音频 VAE model size 不变，分别 2,810,965,664 / 605,149,280 B；
+- 整卡 NVML 峰值 111,574 MiB 包含同卡 8190 服务，不能当作 8191 单进程峰值。
+
+当前显存对比还包含 both 模型组合、动态加载和 FlashInfer workspace，不能把 PyTorch peak 与早先不同运行组合的峰值直接归因于量化。后续应报告最终模型 resident/offloaded、分阶段 torch peak 和独立进程整卡差值。
+
+### 57.10 收紧 CUTLASS FP4 的能力声明
+
+查看本机 FlashInfer 0.6.18 `gemm_base.py:6149` 可见 `_cutlass_gemm_fp4_requirement` 对 `not use_nvfp4` 明确报 `Only cudnn and auto FP4 GEMM supports mxfp4 quantization`。因此 `FlashInferCutlassKernel.can_implement` 已拒绝 MXFP4，只允许 MXFP8；当前默认 MXFP4 仍走已经实测的 CuTe-DSL，不静默改派。
+
+新增 `test_cutlass_rejects_mxfp4`，CPU 环境运行：
+
+```text
+tests/test_mxfp.py -k rejects: 2 passed, 9 deselected
+```
+
+新 backend/layout/test 文件 Ruff check/format 通过。CUTLASS FP4 收紧不影响上述默认 CUPTI 路径。
+
+
+### 57.11 Qwen 精度对照的异常、无效对照识别与 I/O 问题
+
+四组原生文本条件执行 task `bash-n8qb7yvy` 完成，输出 `[1,388,5120]`、FP32，文件在 `logs/mxfp_te_conditioning/`。初次整体统计（含第一个 token）：
+
+| 模型 | relative L2 vs BF16 | RMS | elapsed |
+|---|---:|---:|---:|
+| BF16 | 0 | 12.3024 | 452.147 s |
+| 原 NVFP4 | 0.03149 | 12.3700 | 135.335 s |
+| MXFP4 W4A4 | 11.7013 | 143.5938 | 49.371 s |
+| MXFP4 名义 W4A16 | 11.7013 | 143.5938 | 9.345 s |
+
+MXFP4 输出全部 finite，但 RMS 放大约 11.67 倍，不能用单层 11.24% 权重量化误差直接解释，也不能把它当作正常的“4-bit 略降质”。
+
+名义 W4A16 与 W4A4 的输出逐值完全相同。随后在同一模型实例上切换（task `bash-qz1hqrkl`）确认切换前后 350 个模块的 `_full_precision_mm` 都实际变为 True，但 cond 仍 `torch.equal=True`。这说明该对照没有形成有效的独立精度路径；可能涉及编译缓存或模块执行路径，需直接记录 Linear 权重类型/禁用编译后验证，**不能把它当成“W4A4 与 W4A16 数值完全相同”的模型事实**。
+
+同时排除了 scale 转换错误：`convert_h3_compressed_mx.to_blocked` 对 `(128,8)、(256,8)、(150,8)、(8192,160)、(151936,160)` 均与 Kitchen `float_utils.to_blocked` 逐 byte 相同，`from_blocked` roundtrip 全部相等。全量转换 raw bytes 也已通过，因此多 tile 和非 128 对齐不是目前证据支持的原因。
+
+embedding 前 1024 行的 MXFP8 反量化 relative L2 为 `0.0265613`，与量化记录中的约 2.66% 一致。但第一次 cosine 计算在 float32 norm 后转 float64，出现略大于 1 的舍入结果，需要统一以 double tensor 重算；不使用 `1.00015` 作为精度结论。embedding 行数通过 `get_shape()` 确认是 151936，早期手写 151688 导致的 shape 错误已修正。
+
+补充探针遇到的问题及处理：
+
+- `validate_h3_te_conditioning.py` 增加 `--compare-only` 和排除第一个 sink token 的 double 统计；完整 ComfyUI 离线重算阻塞在 NFS。
+- `bash-v2sbx8nb`、`bash-is2ne330`、`bash-p5erkn6g`、`bash-jc4voz75`、`bash-5fou7zp5` 等辅助进程出现长时间 `rpc_wait_bit_killable`，部分达到后台超时，未返回新的数值结果。已停止可重做的辅助任务，没有停止 8188/8190。
+- `ps` 另确认四个 `VLLM::Worker_TP*` 是高 CPU/大 RSS 的其他任务，不把它们当作本代理进程，也未停止。
+- 本机 `/tmp` 所在 ext4 仅约 5.1 GiB 可用，未贸然复制完整 venv；`/home` 是 NFS。不能把 I/O 等待写成 CUDA/kernel 不支持。
+- 首次不用 PyTorch 的 `.pt` 离线解析报 `KeyError: data/0`，是 `torch.save` ZIP 内路径漏了顶层归档目录，已定位为校验脚本问题并修正为 `<archive_root>/data/<storage_id>`。
+
+当前结论边界：DiT MXFP8 和真实 MXFP4 GEMM 的实现/调用已验证；Qwen MXFP4 端到端数值质量**未通过**，full-precision 对照仍在核查。此处尚不能宣称整个 MXFP8/MXFP4 目标已完成。
+
+
+### 57.12 两个独立根因：MXFP8 embedding 未正确加载 + 源 MXFP4 部分空权重
+
+#### A. MXFP8 embedding 的加载 bug
+
+`ComfyUI/comfy/ops.py` 的 `mixed_precision_ops.Embedding._load_from_state_dict` 原先只接受 per-tensor FP8 和 INT8。`format=mxfp8` 的 embedding 走“保留 marker + 普通加载”分支，导致 FP8 code value 被直接用于 embedding，blocked E8M0 scale 没有参与反量化。原生 MXFP4 Qwen 的 350 个 Linear 与该 embedding 是不同路径，所以“350 个 MXFP4 GEMM 正常”不能证明文本输入正确。
+
+实现修复：
+
+- `TensorCoreMXFP8Layout.dequantize_embedding(qdata, params, indices)`：按 token 行 gather qdata；按 `(row_tile, row%128, col_tile, col_inner)` 计算 128x4 scale 的物理索引，只生成所需行的 BF16/FP32 embedding，不展开整张表。
+- gather 后必须先将 `uint8` 恢复为 `float8_e8m0fnu` view 再转计算 dtype；第一版直接把 uint8 转 BF16，测试正确报出 127 等整数被当成 scale，已修复。
+- `host_rows` 直接在 CPU 原表上按原 token id gather，再把结果搬到目标设备。第一版“先筛 qdata 行、仍传完整 scale + 顺序索引”会错位，测试也已捕获并修复。
+- ComfyUI loader 注册 MXFP8 embedding、保留 E8M0 scale 与 full-precision metadata；缺少 scale 时明确报错，不再静默走原始 FP8 fallback。
+
+新增边界测试覆盖 0/31/32/127/128/129 行和非 128 对齐表：
+
+```text
+comfy-kitchen tests/test_mxfp.py：12 passed
+ComfyUI tests/inference/test_mxfp_quant.py：3 passed
+```
+
+原 `.venv` 没有 pytest，因此测试统一用 `.venv-mxfp`，没有额外安装依赖。
+
+修复后、尚未重建空权重前，独立 full-precision 文本条件的 RMS 从 143.5386 降为 2.6459，与 BF16 的 non-sink cosine 从 0.0582 升到 0.1888，仍不合格。说明 embedding 是实际问题，但不是唯一问题。
+
+#### B. 原 compressed-tensors 文件有 89 个异常量化模块
+
+代表层权重检查 `logs/mxfp_weight_sample_errors.json`：第 0、1、25 层各类 Linear 的 relative L2 大多约 0.11–0.12；第 48、49 层的 relative L2 都为 **1.0**，反量化权重 RMS 为 **0.0**，而 BF16 权重非零。
+
+随后对全部 350 个 MXFP4 Linear 同时检查原 compressed-tensors 和转换后的 native 文件，二者完全一致地出现 **89 个异常模块**：
+
+- layers 5–9：每层 7 个模块，packed 和 scale 全零；
+- layer 42：q/k/v/o_proj packed 和 scale 全零；up_proj packed 非零但 scale 全零；
+- layers 43–49：每层 7 个模块，packed 和 scale 全零。
+
+证据：`logs/mxfp_zero_weight_audit.json`。这排除了 native 转换器制造零权重；原量化日志虽写 351/351，但当时只检查第 0 层和 tensor 数量，漏掉了这些空 tensor。现有日志不能唯一确定历史零权重产生的根本原因，不能编造为 CUDA OOM 或网络错误；当前事实就是源量化产物不完整且不可直接使用。
+
+使用已验证的当前 BF16 文件，对三个代表异常层重新量化：
+
+```text
+model.layers.5.self_attn.q_proj:  packed_nonzero=20,895,415, scale_nonzero=1,310,720, relative_l2=0.115183
+model.layers.42.mlp.up_proj:     packed_nonzero=65,373,160, scale_nonzero=4,096,000, relative_l2=0.112569
+model.layers.49.self_attn.q_proj: packed_nonzero=20,921,097, scale_nonzero=1,310,720, relative_l2=0.112740
+```
+
+预检通过后才启动完整重建 task `bash-yeov6v23`。输出为独立目录 `ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc_repaired/`，不覆盖原始坏文件；日志 `logs/quant_te_mxfp4_repaired.log`。`quantize_h3_te_mxfp4_autoround.py` 已加 `validate_quantized_weight`：源权重 NaN/Inf、源权重全零、packed 全零或 scale 全零都在保存前明确失败。
+
+#### C. 之前 full-precision 对照相同的解释
+
+standalone `load_clip` 使用 `ModelPatcher` 时，`set_model_compute_dtype(torch.float32)` 会把 `comfy_force_cast_weights=True` 传播到 Linear。实测 `q_proj` 的该标志为 True；此时普通模块路径反量化权重，因此切换 `_full_precision_mm` 不会产生不同输出。禁用 compiler 后仍逐值相同，排除了“编译缓存”作为解释。该 standalone 路径与 Nsight 服务中实际捕获到 350 次 MXFP4 GEMM 的服务路径必须区分，不能用 standalone 的相同输出否定真实 kernel trace。
+
+下一步顺序固定为：全量重建 → 350 模块非空与数值检查 → 重新转换 native → 完整 conditioning → 重启隔离服务跑 T2V/CUPTI。任何一项未通过都不提前完成。
+
+
+### 57.13 重建启动阶段的两个已修正错误与最终回归
+
+- `bash-yeov6v23` 首次重建在 embedding 阶段报 `invalid device ordinal`：同时设置 `CUDA_VISIBLE_DEVICES=3` 和 `--device cuda:3`，逻辑设备越界。改为 `--device cuda`。此时尚未量化 Linear。
+- `bash-yqgc5gn1` 随后在 embedding 的非空检查处报 `NotImplementedError: nonzero_count_cpu not implemented for Float8_e4m3fn`。这是旧版 PyTorch API 能力问题，改为 `packed.view(torch.uint8)` 统计，不改动 FP8 数据。最终任务为 `bash-nilt2i9q`，日志 `logs/quant_te_mxfp4_repaired.log`。
+- `validate_h3_te_mxfp4.py` 已扩展 `--model`、`--audit-only`、`--out`：审计全部 350 个 MXFP4 Linear 和 1 个 MXFP8 embedding 的非空 qdata/scale 与 metadata，然后再做单层 GEMM；不再只依赖第 0 层。
+- `validate_h3_te_conditioning.py` 增加 `--mxfp4-model` 和 `--compare-only`，保留 BF16/NVFP4 结果用于后续修复文件对照，不重复加载基线。
+
+最终回归命令：
+
+```bash
+cd /home/kaokaolv/comfyui_h3/comfy-kitchen
+PYTHONPATH=/home/kaokaolv/comfyui_h3/comfy-kitchen CUDA_VISIBLE_DEVICES=2 \
+  /home/kaokaolv/comfyui_h3/.venv-mxfp/bin/python -m pytest \
+  tests/test_mxfp.py tests/test_backends.py tests/test_int8.py tests/test_fp16_linear.py -q
+
+cd /home/kaokaolv/comfyui_h3/ComfyUI
+PYTHONPATH=/home/kaokaolv/comfyui_h3/ComfyUI:/home/kaokaolv/comfyui_h3/comfy-kitchen CUDA_VISIBLE_DEVICES=2 \
+  /home/kaokaolv/comfyui_h3/.venv-mxfp/bin/python -m pytest tests/inference/test_mxfp_quant.py -q
+```
+
+结果：Kitchen **172 passed**（`logs/mxfp_final_kitchen_tests.log`）；ComfyUI **3 passed**（`logs/mxfp_final_comfy_loader_tests.log`）。Ruff check/format 对新增及修改的 MX 文件通过，两个仓库 `git diff --check` 通过。
+
+
+### 57.14 修复权重完成与 native 全量审计通过
+
+完整重建命令（最终成功 task `bash-nilt2i9q`）：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+AUTO_ROUND_LIGHT=1 AUTO_ROUND_REPO=/home/kaokaolv/comfyui_h3/auto-round \
+PYTHONPATH=/home/kaokaolv/comfyui_h3/auto-round CUDA_VISIBLE_DEVICES=3 \
+/home/kaokaolv/.venv-aqa-gpu/bin/python -u quantize_h3_te_mxfp4_autoround.py \
+  --src ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --ref ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --dst-dir ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc_repaired \
+  --device cuda > logs/quant_te_mxfp4_repaired.log 2>&1
+```
+
+全部 351 个模块通过新加的完整性检查，量化阶段 452 s，保存后 `model.safetensors` 为 14,945,516,464 B、1253 tensors。随后：
+
+```bash
+.venv-mxfp/bin/python convert_h3_compressed_mx.py \
+  --src ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc_repaired/model.safetensors \
+  --config ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc_repaired/config.json \
+  --dst ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors
+
+PYTHONPATH=ComfyUI:comfy-kitchen CUDA_VISIBLE_DEVICES=3 \
+  .venv-mxfp/bin/python -u validate_h3_te_mxfp4.py \
+  --model /home/kaokaolv/comfyui_h3/ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors \
+  --audit-only --out logs/mxfp_repaired_audit.json
+```
+
+转换成功：1604 tensors、351 个量化模块、payload 14,945,421,137 B。全文件审计结果：350 MXFP4 + 1 MXFP8，`zero_tensors=[]`，见 `logs/mxfp_repaired_audit.json`。
+
+审计首次因 FP8 `count_nonzero` 未实现而停止，转换本身已成功；已把审计统计统一为 `.view(torch.uint8)`，没有重新转换。随后运行完整 `validate_h3_te_mxfp4.py`，单层 `model.layers.0.self_attn.q_proj` 输出 `[128,8192]`、BF16，`rel_rmse=0.0`、`max_abs=0.0`（相对独立反量化 + GEMM reference），见 `logs/mxfp_repaired_qproj.log`。
+
+后续 conditioning、T2V 和最终 trace 必须使用 `qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors`；旧的 `qwen3vl_32b_minimax_h3_mxfp4.safetensors` 仅保留作错误对照。
+
+
+### 57.15 修复后的 conditioning 通过，开始真实双格式 T2V
+
+执行：
+
+```bash
+cd /home/kaokaolv/comfyui_h3
+PYTHONPATH=ComfyUI:comfy-kitchen CUDA_VISIBLE_DEVICES=3 \
+  .venv-mxfp/bin/python -u validate_h3_te_conditioning.py \
+  --names mxfp4_w4a16 \
+  --mxfp4-model qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors
+
+PYTHONPATH=ComfyUI:comfy-kitchen CUDA_VISIBLE_DEVICES=3 \
+  .venv-mxfp/bin/python -u validate_h3_te_conditioning.py --compare-only \
+  --names bf16,nvfp4,mxfp4_w4a16 \
+  --mxfp4-model qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors
+```
+
+第一次离线比较把 `CUDA_VISIBLE_DEVICES` 设为空，导入 ComfyUI 时 `torch.cuda.current_device()` 报 `No CUDA GPUs are available`；恢复 GPU 可见后仅重跑比较，没有重跑文本编码。模型执行日志在 `logs/mxfp_te_conditioning_repaired.log`，比较结果在 `logs/mxfp_te_conditioning/comparison.json`。
+
+以下指标排除第一个 sink token，使用 double 计算：
+
+| 文本编码器 | relative L2 vs BF16 | 整体 cosine | 最小逐 token cosine | median 逐 token cosine | RMS |
+|---|---:|---:|---:|---:|---:|
+| 原 NVFP4 | 0.0915106 | 0.995807 | 0.600569 | 0.997582 | 4.09938 |
+| 修复 MXFP4（W4A16 reference） | 0.115280 | 0.993787 | 0.775913 | 0.995351 | 3.97775 |
+| BF16 reference | 0 | 1 | — | — | 4.12737 |
+
+相比旧文件的 RMS=143.54 / cosine=0.0582，embedding 修复与 89 个空模块重建已使文本条件恢复正常。W4A16 reference 与 BF16 的余量略大于原 NVFP4，这是实际量化误差，不能宣称无损。
+
+随后只停止旧 8190 task `bash-oy2oyhq4`，用包含 embedding 修复的源码启动新 task `bash-5y37i327`，原 8188 未停止。完整 T2V task `bash-c5q9d3sj`：
+
+```bash
+PYTHONPATH=/home/kaokaolv/comfyui_h3/comfy-kitchen CUDA_VISIBLE_DEVICES=1 \
+  .venv-mxfp/bin/python -u run_h3_mxfp_workflow.py \
+  --port 8190 --label both_mxfp8_mxfp4_repaired \
+  --dit minimax_h3_fl2va_pruned_mxfp8.safetensors \
+  --clip qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors
+```
+
+prompt `3f2a3bd9-5d86-496d-bc00-39924516484e`；服务日志 `logs/comfyui_mxfp_8190_repaired.log` 已确认 Qwen 选择 `flashinfer_cutedsl` MXFP4、DiT 选择 `flashinfer_cutedsl` MXFP8。完整采样与媒体结果待后续记录。
+
+
+### 57.16 AAC/黑屏的根因定位：BF16 attention 产生 NaN，恢复 FP32 attention
+
+修复空权重后，完整 T2V prompt `3f2a3bd9-5d86-496d-bc00-39924516484e` 完成 20 steps 和两个 VAE，但 `SaveVideo` 仍报 `avcodec_send_frame() returned 22`。为区分编码器和上游数据，复用缓存执行两个诊断，不重跑采样：
+
+- `SaveAudio` 直接输出 FLAC 成功，说明不是简单的“所有音频编码器都失败”；
+- 去掉音轨后 `SaveVideo` 成功，但视频 124 帧的 std 全为 0（全黑）；
+- FLAC 解码后是常量 `-32768`，说明上游非有限值被整数转换饱和，AAC 只是最后拒绝 NaN 的位置。不能把这两个保存成功当作有效媒体。
+
+#### 逐层定位
+
+真实 W4A4 探针首先确认修复后的 embedding 全部 finite、RMS=0.021984。随后第 0 层各子模块：
+
+```text
+input_norm: FP32, finite=True
+q/k/v_proj: BF16, finite=True
+q_norm/k_norm: BF16, finite=True
+attention 内部输出: NaN
+o_proj/MLP/block: 因上游 attention NaN 而全部为 NaN
+```
+
+证据：`logs/mxfp_te_first_block_probe.log/json`。初版全 50 层探针虽然退出码为 0，但 cond 有 1,986,560 个 NaN；后续探针已加 `assert torch.isfinite(cond).all()`，不再把退出码当作正确性。
+
+`validate_h3_te_mxfp4.py` 新增 `--m` 和 `--all-shapes`，对实际 prompt 的 M=388 覆盖 q/k/v/o_proj、gate/up/down_proj 七种形状。全部通过：`logs/mxfp_repaired_all_shapes_m388.log` 中每个 `rel_rmse=0.0, max_abs=0.0`（相对独立反量化 + GEMM reference）。因此不能用某个 Linear shape 的 kernel 错误来解释该 NaN。
+
+原 NVFP4 CUPTI 的 Qwen 是 FP32 GEMM + `fmha_cutlassF_f32_aligned` FP32 attention；新增 MXFP4 则变成 BF16 attention。`ComfyUI/comfy/text_encoders/llama.py` 的 `Attention.forward` 现在在 q/k/v reshape/transpose 后显式 `.to(hidden_states.dtype)`：MXFP4 Linear 仍输出 BF16 并执行真实 GEMM，但 attention 恢复与原始模型一致的 FP32 载体，o_proj 输入再按需量化。没有修改 DiT 的 FlashAttention、视频 VAE Sage INT8 attention 或音频 VAE FP32 路径。
+
+#### 修复后实测
+
+`logs/mxfp_te_w4a4_layer_probe_fixed.json`：全部 50 层 finite、无 NaN/Inf；真实 W4A4 对 BF16 的 non-sink 指标：
+
+- relative L2 `0.184289`；cosine `0.984240`；
+- cond RMS `3.84819`；max_abs `46.2994`。
+
+与 W4A16 reference（cosine `0.993787`）相比，activation FP4 量化确实带来额外误差，但不再是 NaN 或语义完全损坏。
+
+新增 `test_attention_preserves_carrier_dtype_with_bf16_projections`：模拟 BF16 projection + FP32 carrier，验证 attention 收到 FP32 q/k/v、o_proj 仍输出 BF16。测试中逐步修正了配置参数、RoPE identity 和 `skip_reshape=True` 输出布局这些测试脚手架问题，最终 `tests/inference/test_mxfp_quant.py` **4 passed**。
+
+只停止旧 8190 task `bash-5y37i327`，启动包含 attention 修复的 task `bash-vtd5ur10`。完整音视频重跑 task `bash-nrt6aags`，日志 `logs/mxfp_both_attention_fixed_t2v.log` 与 `logs/comfyui_mxfp_8190_attention_fixed.log`。结果待取得后记录。
+
+
+### 57.17 修复后的完整音视频通过
+
+`bash-nrt6aags` 成功完成，prompt `28a11338-258b-476f-a48d-2ba237efaf20`，耗时 274.659 s。输出：
+
+```text
+/home/kaokaolv/comfyui_h3/ComfyUI/output/video/MiniMax_H3_00014_.mp4
+H.264 / 864x480 / 24 fps / 124 frames / AAC 32kHz stereo
+```
+
+`logs/mxfp_runs/both_mxfp8_mxfp4_attention_fixed/run_result.json` 保存完整 status 和逐 packet 解码验证。进一步用原 `validate_media` 检查：
+
+- 文件 1,445,398 B，duration 5.166688 s；
+- 124 帧全部可解码，视频 std 范围 28.0384–60.9005（不是黑屏）；
+- 165,334 个音频采样，audio max abs 0.613151（不是静音/饱和常量）。
+
+同帧对照图 `logs/mxfp_runs/media_contact_sheet_repaired.png` 已实际查看：修复后的 MXFP8 DiT + MXFP4 Qwen 与基线/MXFP8 DiT 一样，生成屋顶追逐、跨楼跳跃等 prompt 场景，不再是旧 MXFP4 的室内聚会或黑屏。完整数据 `logs/mxfp_runs/media_comparison_repaired.json`。
+
+最终 CUPTI 使用同一 repaired Qwen、MXFP8 DiT 和包含 FP32 attention 修复的源码：
+
+- 8191 服务 task `bash-ujyrw0uf`，prompt `948a6c78-aac2-4217-acc1-31e1b14c32f6`；
+- 采集 task `bash-1aan3cdz`；
+- trace 前缀 `logs/mxfp_cupti/attention_fixed/h3_attention_fixed`；
+- 启动和运行日志 `logs/mxfp_cupti_attention_fixed_server.log`、`logs/mxfp_cupti_attention_fixed_run.log`；
+- 同时复用 Monitor 保存独立进程的 torch peak、模型 resident/offload 和整卡 NVML。
+
+`git diff --check` 通过。当前 ComfyUI 的额外 attention dtype 回归为 4 passed；Kitchen 全量仍为 172 passed。待 trace 导出后核对实际 GEMM、FP32 attention、显存和完成状态，不以服务启动日志代替 CUPTI 结论。
+
+
+### 57.18 最终 CUPTI、显存与交付验收
+
+最终 prompt `948a6c78-aac2-4217-acc1-31e1b14c32f6`：`success=true, completed=true`，profiler start/stop 正常，执行时间 392.631 s；完整驱动 393.885 s。trace 文件：
+
+```text
+logs/mxfp_cupti/attention_fixed/h3_attention_fixed.nsys-rep  (12,688,230 B)
+logs/mxfp_cupti/attention_fixed/h3_attention_fixed.sqlite    (27,844,608 B)
+```
+
+`PRAGMA integrity_check=ok`。对应 MP4 `MiniMax_H3_00015_.mp4` 通过全帧/音频解码和非空检查；`logs/mxfp_runs/cupti_attention_fixed/run_result.json`、`logs/mxfp_cupti/attention_fixed/comparison.json` 为证据。8191 task `bash-ujyrw0uf` 已停止，8188 和修复后的 8190 保留。
+
+#### 最终真实 kernel
+
+执行 `analyze_h3_cupti.py ... --out logs/mxfp_cupti/attention_fixed/analysis` 后确认：
+
+| 阶段 | 实际 kernel / 次数 | 结论 |
+|---|---|---|
+| DiT 20 steps | `Sm100BlockScaledPersistentDenseGemmKernel` **4000**；`quantize_mxfp8_kernel<bf16>` **4000** | 每步 200 个 MXFP8 Linear 和 activation 量化，一致 |
+| Qwen 50 layers | `Sm100BlockScaledPersistentDenseGemmKernel` **350**；`quantize_with_block_size<...,32,...>` **350** | 每层 7 个 MXFP4 Linear 和 activation 量化，一致 |
+| Qwen attention | `fmha_cutlassF_f32_aligned...` **50** | attention 已恢复 FP32，避免 BF16 attention 的 NaN |
+
+Qwen range 没有原先 350 次普通 FP32 GEMM；DiT 内仍存在的普通 GEMM 是未量化辅助投影，不是用 dequantize 替代 200 个 MX Linear。最终 trace 同时包含真实 MX GEMM、FP32 attention、原视频/音频 VAE。
+
+#### 时间对照（相同 B200、PyTorch/ComfyUI 版本、同一 prompt 的单次 NVTX wall time）
+
+| 项目 | 原 INT8/NVFP4 | 最终 MXFP8/MXFP4 | 变化 |
+|---|---:|---:|---:|
+| DiT 首步（含初始化） | 178.617 s | 174.752 s | -2.17% |
+| DiT 稳态平均/step | 1.1607 s | 1.0013 s | **-13.73%** |
+| Qwen prefill | 113.043 s | 116.319 s | +2.90% |
+| CUPTI 驱动总耗时 | 394.808 s | 392.631 s | 基本相同 |
+
+这些是本机单次测量，冷启动包含 JIT、磁盘、共享文件系统影响，不能外推为所有硬件/形状的保证。`logs/mxfp_cupti/attention_fixed/comparison.json` 保存逐 kernel 原始行。
+
+#### 显存与模型大小
+
+`logs/mxfp_cupti/attention_fixed/memory_comparison.json`：
+
+| 指标 | 原 INT8/NVFP4 | 最终 MXFP8/MXFP4 | 变化 |
+|---|---:|---:|---:|
+| DiT model size | 20,967,535,680 B | 21,557,467,480 B | +2.81% |
+| Qwen model size | 15,686,911,147 B | 14,945,392,032 B | **-4.73%** |
+| torch max allocated | 675,122,896 B | 633,100,556 B | -6.22% |
+| torch max reserved | 905,969,664 B | 939,524,096 B | +3.70% |
+| 视频/音频 VAE model size | 不变 | 不变 | — |
+
+最终进程采样 613 个，0 错误。整卡 NVML 峰值 76,138 MiB 包含同时运行的 8190，**不能作为单进程显存**。MXFP8 DiT 比 INT8 权重更大，因此不宣称整体权重或 reserved 显存必然下降；Qwen MXFP4 权重减小是独立实测。动态 resident/offload 数据保留在 `memory_final.json` 和 `memory_samples.json`。汇总脚本最初把嵌套 sample 当成顶层 `models` 读取，已修正为 `sample['memory']`，原始采样未受影响。
+
+#### 最终回归与有效交付物
+
+- Kitchen `tests/test_mxfp.py + test_backends.py + test_int8.py + test_fp16_linear.py`：**172 passed**。
+- ComfyUI `tests/inference/test_mxfp_quant.py`：**4 passed**（MXFP4 Linear/非法 scale、MXFP8 embedding、attention dtype）。
+- `logs/mxfp_repaired_all_shapes_m388.log`：实际 M=388 的七种 Qwen Linear 均 `rel_rmse=0.0, max_abs=0.0`（相对独立 reference）。
+- 有效 DiT：`ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_mxfp8.safetensors`。
+- 有效 Qwen：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors`；351 个量化模块全部 `zero_tensors=[]`。
+- 最终非 profiling 输出：`ComfyUI/output/video/MiniMax_H3_00014_.mp4`；profiling 输出：`MiniMax_H3_00015_.mp4`。
+- 修复后服务：`http://0.0.0.0:8190`（物理 GPU 1），原 `8188` 未改。
+
+旧 `qwen3vl_32b_minimax_h3_mxfp4.safetensors` 和 `..._llmc/` 是含空权重的错误对照，不是交付模型。完整 C++ CMake 构建问题没有宣称解决；本次使用同版本 `_C.abi3.so` 构建产物与官方 FlashInfer JIT/CuTe-DSL。`flashinfer-cubin` 的准备超时不是当前 kernel 的依赖，未用其失败掩盖实现状态。
+
+
+### 57.19 收尾清理与状态确认
+
+- 最终 ComfyUI 测试重新执行并保存 `logs/mxfp_final_comfy_loader_tests.log`：**4 passed**，与包含 attention 修复的最终源码一致；Kitchen 日志保持 **172 passed**。
+- 早期 `.mxfp_bin/nvcc` 包装器包含不存在的 CUDA runtime include 路径，已删除；没有把它当作有效 toolkit。当前验收使用官方 FlashInfer JIT-cache、CuTe-DSL 和同版本 `_C.abi3.so`。
+- 原始异常模型与错误输出保留作对照；最终有效模型、媒体、转换器、校验脚本和日志均保留。
+- 后台仅保留原 8188 服务与最终修复的 8190 服务；8191 与其他临时量化/profiling 进程均已结束。
+
+
+### 57.20 8190 后台任务时限与重启
+
+最终 8190 task `bash-vtd5ur10` 在运行 3600 s 后被后台任务时限终止，随后 `/system_stats` 返回 connection refused；这不是模型、kernel 或 ComfyUI 执行错误。原 8188 仍正常运行。
+
+按相同 `.venv-mxfp`、本地 `comfy-kitchen`、物理 GPU 1 和最终修复源码重启：
+
+- 新 task：`bash-71juqsga`，设置 `disable_timeout=true`，不再按小时终止服务；
+- 日志：`logs/comfyui_mxfp_8190_restart.log`；
+- 健康检查：`http://127.0.0.1:8190/system_stats` 在约 2 s 后返回成功，ComfyUI 0.45.0，设备为 B200。
+
+此次只重启服务进程，未改变代码或模型，因此不重复此前已经通过的完整 T2V 和 CUPTI 验证。

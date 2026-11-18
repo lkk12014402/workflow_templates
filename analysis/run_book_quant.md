@@ -294,3 +294,211 @@ E8M0（2 的幂）scale，E4M3 只有 3 位 mantissa；MXFP8 的 block 更细，
 脚本：
 - `validate_h3_int8_convrot.py`（本次新增）
 - `validate_h3_mxfp8.py`（上一节）
+
+---
+
+## 4. 确认 DiT 的 mxfp8/int8 模块分区，并量化 TE 到 MXFP4
+
+### 4.1 确认：DiT mxfp8 与 int8 的量化/未量化分区一致
+
+实测两个文件的 header：
+
+- `minimax_h3_fl2va_pruned_int8_convrot.safetensors`：200 个 `comfy_quant` 模块；
+- `minimax_h3_fl2va_pruned_mxfp8.safetensors`：200 个 `comfy_quant` 模块；
+- 两者模块名集合 `q8 == qm` 为 **True**，`.weight` 键集合相同；
+- 唯一 dtype 差异：200 个目标权重 I8 → F8_E4M3；side-car 从 F32 `weight_scale` 变为 U8 `weight_scale` + U8 `comfy_quant`；
+- 非目标 tensor 不变：BF16 220 / F16 102 / F32 10。
+
+结论：**是的，mxfp8 与 int8 的量化模块和未量化模块完全一致。**
+
+### 4.2 TE 的分区（nvfp4 参考文件）
+
+`qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`：
+
+- 350 个 nvfp4 模块：`model.layers.{0..49}` 的 q/k/v/o_proj + gate/up/down_proj；
+- 1 个 int8 模块：`model.embed_tokens`（`int8_tensorwise`）；
+- `visual.*` 351 个 tensor，全部 BF16；
+- 100 个 `pre_quant_scale`（仅 o_proj/down_proj）；
+- 无 `model.norm` / `lm_head`（50 层截断版）。
+
+用户选择：350 个 linear → **MXFP4**；`model.embed_tokens` → **MXFP8**；输出格式 **auto-round llm_compressor（compressed-tensors）**。
+
+### 4.3 重要限制
+
+- ComfyUI **没有 mxfp4 layout**（`comfy_kitchen/tensor/` 只有 `nvfp4.py`/`mxfp8.py`，`quant_ops` 无 mxfp4），所以这份 TE 不能像 DiT mxfp8 那样直接做 ComfyUI 单文件加载；输出是 llm-compressor 目录。
+- base 是 **50 层截断** Qwen3-VL-32B，没有 `model.norm` / `lm_head`；标准 HF/vLLM 加载可能拒绝。脚本按 HF 风格改名（`model.language_model.*` / `model.visual.*`）并写 50 层 config，但仍不是完整模型。
+- `pre_quant_scale` 是 modelopt AWQ 的 side-car；纯 auto-round MXFP4 不使用/不生成它。
+
+### 4.4 执行
+
+下载 base（51.5GB）和 config/tokenizer assets：
+
+```bash
+HF_HOME=/home/kaokaolv/comfyui_h3/.cache/huggingface \
+.venv/bin/hf download Comfy-Org/MiniMax-H3 \
+  text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --local-dir ComfyUI/models
+```
+
+- 文件：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`
+- 51,506,295,256 B；sha256 `600d567f6a9629c8574e8e7041b199bdd9c59a986afa7906910a81919610607d`（hf metadata）
+- assets：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_assets/`（config.json + tokenizer 文件）
+
+新增脚本：`quantize_h3_te_mxfp4_autoround.py`
+
+- 350 个 linear：`quant_mx_opt_rtn(bits=4, group_size=32, data_type="mx_fp4")` + 本地 E2M1 打包（与 auto-round `QuantLinear.pack` 同规则：low nibble first、sign bit 3）；
+- embed：`quant_mx_opt_rtn(bits=8, group_size=32, data_type="mx_fp8")`；
+- 输出 `weight_packed`/`weight_scale`（MXFP4）和 `weight`/`weight_scale`（MXFP8），HF 风格 key；
+- `config.json` 写 50 层 + `quantization_config`（mixed-precision: group_0 embed mxfp8-quantized, group_1 Linear mxfp4-pack-quantized, ignore model.visual）。
+
+命令：
+
+```bash
+AUTO_ROUND_LIGHT=1 AUTO_ROUND_REPO=/home/kaokaolv/comfyui_h3/auto-round \
+PYTHONPATH=/home/kaokaolv/comfyui_h3/auto-round \
+/home/kaokaolv/.venv-aqa-gpu/bin/python -u quantize_h3_te_mxfp4_autoround.py \
+  --src ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors \
+  --ref ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+  --dst-dir ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc \
+  --device cuda:3 --overwrite
+```
+
+日志：`logs/quant_te_mxfp4.log`。
+
+### 4.5 单层 smoke test
+
+`model.layers.0.self_attn.q_proj`（8192×5120）：
+
+- MXFP4 packed `[8192,2560]` U8 + scale `[8192,160]` U8（E8M0 116..123）；
+- 反量化（`2**(scale-127)` + codebook）对 BF16：**rel_RMSE 11.24%**，cos 0.9937；
+- 对照：MXFP8 同层 2.66%，int8_convrot 0.90%。
+
+### 4.6 输出预期
+
+- tensor 总数：902（base）- 351（被替换的 weight）+ 700（350×2 MXFP4）+ 2（embed weight+scale）= **1253**。
+- dtype：U8 ×701（350 packed + 350 scale + 1 embed scale）、F8_E4M3 ×1（embed）、BF16 ×551（visual 351 + norms 200）。
+- 目录：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc/`
+  - `model.safetensors`（~15 GB）
+  - `config.json`（50 层 text_config + quantization_config）
+  - tokenizer/processor 文件（从 assets 复制）
+- `quantization_config`：
+  - group_0：`model.language_model.embed_tokens` → `mxfp8-quantized`，8-bit group 32；
+  - group_1：`Linear` → `mxfp4-pack-quantized`，4-bit group 32；
+  - `format: mixed-precision`，`ignore: [model.visual]`。
+
+### 4.7 base 校验
+
+- `qwen3vl_32b_minimax_h3_bf16.safetensors`：51,506,295,256 B；
+- hf metadata sha256 `600d567f…607d`，与 HF API 的 LFS oid 一致（revision `4b53a35…`）。
+
+### 4.8 产物说明
+
+- `model.safetensors` 是 **单文件**（未分片）；compressed-tensors/vLLM 可直接读取单 shard。
+- 文件内 key 默认已改为 HF 风格（`model.language_model.*` / `model.visual.*`）；
+  若需要 ComfyUI 的 `model.layers.*` 形式，可加 `--keep-comfyui-keys` 重跑（但 ComfyUI 仍无 mxfp4 layout）。
+- 由于 base 是 50 层截断 TE（无 `model.norm`/`lm_head`），这份 checkpoint 不是完整 HF 模型；
+  vLLM 标准加载可能报缺权重。它主要用于量化权重/配置的检查与后续自定义加载。
+
+### 4.9 TE 量化完成与校验
+
+输出：
+
+- 目录：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc/`
+- `model.safetensors`：**14.946 GB**，**1253 tensors**
+- dtype：`BF16 551 / F8_E4M3 1 / U8 701`（350 MXFP4 packed + 350 scale + 1 embed scale）
+- 351 个量化模块（350 MXFP4 linear + 1 MXFP8 embed）
+- `config.json`：`format=mixed-precision`；
+  - `group_0`: `model.language_model.embed_tokens` → `mxfp8-quantized`，8-bit group 32；
+  - `group_1`: `Linear` → `mxfp4-pack-quantized`，4-bit group 32；
+  - `ignore: [model.visual]`。
+- tokenizer/processor 文件已复制。
+
+单层校验：
+
+- `model.language_model.layers.0.self_attn.q_proj` MXFP4：packed `(8192,2560)` + scale `(8192,160)`，
+  反量化对 BF16 **rel_RMSE 11.2358%**（cos 0.9937）。
+- 对照：同层 MXFP8 2.66%、int8_convrot 0.90%。
+
+**发现并修复的 bug**：`hf_name()` 对 `model.embed_tokens`（没有末尾点）没有匹配，
+输出里的 key 是 `model.embed_tokens.*`，与 `config.json` 的 target `model.language_model.embed_tokens` 不一致。
+已把 `hf_name` 改为同时匹配 `key == "model.embed_tokens"` 和 `key.startswith("model.embed_tokens.")`；
+并用 `.tmp/rename_te_embed.py` 对已生成的文件做 key 重命名（读 15GB + 重写 15GB），日志 `logs/rename_te_embed.log`。
+重命名后需重跑 `validate_h3_te_mxfp4.py` 验证 embed 的 MXFP8 误差。
+
+### 4.10 key 重命名收尾
+
+- 临时文件 `.tmpTcpmcP` 已完整写出：14,945,516,464 B，1253 tensors，
+  embed key 已是 `model.language_model.embed_tokens.weight/weight_scale`。
+- 原进程卡在 `os.replace`/fsync（Weka D 状态 10 分钟），已停止进程；
+  手动 `mv .tmpTcpmcP model.safetensors`（同目录原子替换），`chmod 664`。
+- 最终 `model.safetensors`：14,945,516,464 B（~14.946 GB），mtime 08:11。
+- `validate_h3_te_mxfp4.py` 的 embed 读取改为 `safe_open.get_slice(...)[:1024]`，
+  只读前 1024 行，避免把 0.8GB/1.6GB 的完整 embedding 读进内存。
+
+### 4.11 最终状态
+
+- TE 量化**已完成**，最终 `model.safetensors` = 14,945,516,464 B（~14.946 GB），1253 tensors。
+- dtype：BF16 551 / F8_E4M3 1 / U8 701。
+- 351 个量化模块：350 个 MXFP4 linear + 1 个 MXFP8 `model.language_model.embed_tokens`；
+  embed key 已修正为 `model.language_model.embed_tokens.weight/weight_scale`。
+- `config.json`：50 层、mixed-precision；group_0 embed mxfp8-quantized（8-bit group 32），
+  group_1 Linear mxfp4-pack-quantized（4-bit group 32），ignore `model.visual`。
+- 已校验：`layers.0.self_attn.q_proj` MXFP4 rel_RMSE **11.2358%**，cos 0.9937。
+- embed MXFP8 的 RMSE 校验被 Weka I/O 阻塞（73 s 只读了 4.9 KB 头），已停止；
+  这不影响量化产物，等文件系统空闲时再跑 `validate_h3_te_mxfp4.py` 即可。
+
+### 4.12 产物路径
+
+```
+ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_llmc/
+├── model.safetensors      14.946 GB, 1253 tensors
+├── config.json            50 层 + quantization_config (mixed-precision)
+├── tokenizer.json / tokenizer_config.json / vocab.json / merges.txt
+├── chat_template.json
+└── preprocessor_config.json / video_preprocessor_config.json
+```
+
+
+### 4.13 重要纠正：原 MXFP4 产物存在空权重，不能只凭第 0 层判定完成
+
+后续全模型验证发现 §4.9–4.12 的原 `qwen3vl_32b_minimax_h3_mxfp4_llmc/model.safetensors` **不能作为有效模型使用**。旧校验仅覆盖 `layers.0.self_attn.q_proj` 和 header/tensor 数量，无法代表全文件。
+
+全量检查（详见 `run_book.md` §57.12 和 `logs/mxfp_zero_weight_audit.json`）发现：
+
+- layers 5–9 的全部 Linear、layer 42 的 q/k/v/o/up_proj、layers 43–49 的全部 Linear，共 **89 个异常模块**；
+- 大多数 packed 和 scale 全零；layer 42 up_proj packed 非零但 scale 全零；
+- 转成 Comfy native 的文件忠实保留这些错误，转换器不是零数据的来源；
+- 第 0、1、25 层的约 11% 反量化误差不能证明第 48、49 层有效；后两层实测反量化全零。
+
+同时发现原运行时只支持 FP8/INT8 embedding，MXFP8 embedding 的 scale 未正确参与反量化；已在 `ComfyUI/comfy/ops.py` 和 `comfy-kitchen/comfy_kitchen/tensor/mxfp8.py` 修复，详见 `run_book.md` §57.12。旧 §4.3“ComfyUI 没有 MXFP4 layout”是当前实现前的历史状态；本轮已补 MXFP4 Linear 与 MXFP8 embedding 支持。
+
+当前处理：用已校验的 BF16 重新完整量化到 `qwen3vl_32b_minimax_h3_mxfp4_llmc_repaired/`，保留原坏文件作证据；量化脚本新增源全零、packed 全零、scale 全零和 NaN/Inf 检查。新产物仍需全量非空、条件输出、T2V 和 CUPTI 验收后才可替换旧结论。
+
+
+### 4.14 修复产物已生成并通过全文件非空审计
+
+从当前已校验 BF16 全量重建 `qwen3vl_32b_minimax_h3_mxfp4_llmc_repaired/` 已完成：
+
+- 351 个量化模块均通过源非零、packed 非零、scale 非零和 NaN/Inf 检查；
+- `model.safetensors`：14,945,516,464 B，1253 tensors；
+- 新 native：`ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors`；
+- native 全文件审计：350 个 MXFP4 Linear + 1 个 MXFP8 embedding，`zero_tensors=[]`，见 `logs/mxfp_repaired_audit.json`；
+- 真实 q_proj GEMM 与独立 reference：`rel_rmse=0.0`、`max_abs=0.0`，见 `logs/mxfp_repaired_qproj.log`。
+
+原始 `qwen3vl_32b_minimax_h3_mxfp4_llmc/` 和 `qwen3vl_32b_minimax_h3_mxfp4.safetensors` 保留为错误对照，不再用于最终推理。端到端 conditioning、T2V 与 CUPTI 结果继续记录在 `run_book.md` 第 57 节。
+
+
+### 4.15 最终端到端验收与 attention 修复
+
+修复权重通过非空审计后，又发现并修复了运行时 dtype 问题：真实 MXFP4 Linear 输出 BF16，Qwen attention 直接沿用该 dtype 会在第 0 层产生 NaN，最终造成黑视频和 AAC 编码错误。`ComfyUI/comfy/text_encoders/llama.py` 已在 attention 前恢复 `hidden_states.dtype`，本 workflow 中为 FP32；MXFP4 GEMM 本身未改成普通 GEMM。
+
+最终结果：
+
+- 全部 50 层 finite，真实 W4A4 对 BF16 的 non-sink relative L2 `0.184289`、cosine `0.984240`；
+- W4A16 reference 对 BF16 的 relative L2 `0.115280`、cosine `0.993787`；
+- 七种 Qwen Linear 形状在实际 M=388 下均与独立 reference 完全一致；
+- 完整 H.264 + AAC 音视频 `MiniMax_H3_00014_.mp4` 和 profiling 输出 `MiniMax_H3_00015_.mp4` 均非空且场景正确；
+- 最终 CUPTI：DiT 每步 200 次 MXFP8 GEMM，Qwen 350 次 MXFP4 GEMM，Qwen attention 为 FP32；
+- Kitchen 172 passed，ComfyUI 4 passed。
+
+因此，`qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors` 已通过本任务的端到端验收；旧文件的零权重、embedding 和 attention 问题均已分别定位并处理。所有细节和原始证据见 `run_book.md` 第 57 节及 `logs/mxfp_cupti/attention_fixed/`。

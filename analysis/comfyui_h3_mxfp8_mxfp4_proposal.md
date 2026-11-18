@@ -1,12 +1,12 @@
 # H3 dense Linear MXFP8 / MXFP4 接入 ComfyUI / Comfy-Kitchen：设计 Proposal
 
-> 状态：**供审阅的设计稿，尚未实现，尚未运行 MXFP GEMM**。
+> 状态：**已实现 MXFP8/MXFP4 dense Linear 与真实 MX GEMM；实现、问题修复及端到端验收见 `run_book.md` 第 56–57 节。**
 >
 > 目标 workflow：`video_minimax_h3_t2v.json`。
 >
 > 首要硬件：本机 B200（SM100）。优先支持当前 workflow 的 dense Linear，不展开 MoE、专家路由、训练量化或完整跨平台后端矩阵。
 >
-> 本文将已核实的现状、推荐设计和待实测事项分开陈述。文中的接口代码是设计示意，不是已经存在的实现。
+> 本文保留已核实的现状、推荐设计和实测要求。接口代码是设计示意；实际实现、限制和验证结果以文末实施记录及源码为准。
 
 ## 1. 结论与推荐路线
 
@@ -887,4 +887,57 @@ Marlin、B12x、其他 GPU、训练、MoE、CUDA Graph 全图化和通用 compre
 
 ---
 
-**本 proposal 的完成不代表 MXFP8/MXFP4 已在 H3 上运行。** 下一步应先审阅格式、dtype 和 backend 策略，再从 P0 的小矩阵实测开始。
+**上述内容是原设计与评审基线，不是未实现的声明。** 当前实现、模型修复、测试和端到端验收以 `run_book.md` 第 56–57 节及实际源码为准。
+
+
+## 19. 当前实现与实测验收
+
+### 19.1 落地的软件结构
+
+实现保留原设计边界：原生 ComfyUI + Comfy-Kitchen 统一调度，FlashInfer 执行真实 block-scaled GEMM，不复制 CUTLASS/CuTe kernel，不引入 vLLM runtime。
+
+- `comfy-kitchen/comfy_kitchen/backends/cuda/mx_linear.py`：`MXLinearConfig`、候选 kernel、`is_supported(device)` / `can_implement(config)`、环境变量选择与详细 `NoCapableBackendError`。MXFP8 可选 FlashInfer CuTe-DSL/CUTLASS；MXFP4 默认 CuTe-DSL。依据本机 FlashInfer 源码，CUTLASS FP4 明确拒绝 MXFP4，不静默改派。
+- `comfy-kitchen/comfy_kitchen/tensor/mxfp4.py`：MXFP4 E2M1 packed layout、逻辑 transpose、128x4 scale、Linear/addmm/mm 和 shape 恢复。
+- `comfy-kitchen/comfy_kitchen/tensor/mxfp8.py`：接入真实 GEMM，并新增 MXFP8 embedding 的按行反量化。物理 scale 索引覆盖 128x4 tile 与非对齐表尾，不展开整张 BF16 embedding。
+- `comfy-kitchen/backends/eager/quantization.py` 与公开 registry：MXFP4 quantize/dequantize/GEMM reference、fake/meta、CUDA/eager 接口。eager reference 是显式校验路径，不冒充硬件 fast path。
+- `ComfyUI/comfy/quant_ops.py`、`comfy/ops.py`：复用 `.comfy_quant + QuantizedTensor + mixed_precision_ops`；校验 packed shape、group 32 和 scale layout；MXFP4 显式 `full_precision_matrix_mult=false` 覆盖文本编码器父级默认，同时支持 MXFP8 embedding 正确加载与 host_rows。
+- `ComfyUI/comfy/text_encoders/llama.py`：projection 后 q/k/v 转回 `hidden_states.dtype`。MXFP4 Linear 仍执行 BF16 GEMM，attention 恢复原始 FP32 载体，避免实测的 BF16 attention NaN；DiT、VAE attention 路径未改。
+
+### 19.2 模型转换与发现的三个实际问题
+
+1. 原 Qwen compressed-tensors 文件有 89 个异常模块（layers 5–9、42–49 的部分或全部 Linear）packed/scale 为空。单层和 header 数量校验无法发现它。已用 BF16 全量重建到 `qwen3vl_32b_minimax_h3_mxfp4_llmc_repaired/`，再转换为 native `qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors`。新审计覆盖全部 351 个量化模块，`zero_tensors=[]`。
+2. 原 `mixed_precision_ops.Embedding` 不支持 MXFP8 block-scaled embedding，导致原始 FP8 code value 被误当数值且 scale 未正确使用。已补按行 gather 与 loader，并验证 tile 边界、host/offload 和 metadata round-trip。
+3. 真实 MXFP4 的 BF16 attention 在第 0 层产生 NaN，随后造成全黑视频和 AAC `avcodec_send_frame()` error 22。恢复 FP32 attention 后，50 层全部 finite，完整音视频正常。这里没有通过 clamp、删除音轨或普通 GEMM 掩盖错误。
+
+原始异常 Qwen 文件保留作对照，**不作为运行模型**。有效文件为：
+
+```text
+ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_mxfp8.safetensors
+ComfyUI/models/text_encoders/qwen3vl_32b_minimax_h3_mxfp4_repaired.safetensors
+```
+
+### 19.3 数值、输出和 CUPTI 证据
+
+- 七种 Qwen Linear 形状在实际 M=388 下均通过真实 GEMM 与独立 reference 对照，`rel_rmse=0.0, max_abs=0.0`。
+- W4A16 文本条件对 BF16：relative L2 `0.115280`，cosine `0.993787`。
+- 真实 W4A4 文本条件对 BF16：relative L2 `0.184289`，cosine `0.984240`，全部 50 层 finite。
+- 完整输出 `ComfyUI/output/video/MiniMax_H3_00014_.mp4`：H.264、864x480、24fps、124 帧、AAC 32kHz 双声道；非黑屏、非静音，屋顶动作场景与 prompt 一致。profiling 输出为 `MiniMax_H3_00015_.mp4`，同样通过。
+- 最终 `logs/mxfp_cupti/attention_fixed/h3_attention_fixed.sqlite` 完整且 `integrity_check=ok`：DiT 每步 200 次 MXFP8 GEMM，20 步共 4000；Qwen 共 350 次 MXFP4 GEMM；activation 量化次数一一对应；Qwen FP32 attention 为 50 次。
+- Kitchen 全回归 **172 passed**，ComfyUI loader/embedding/attention 回归 **4 passed**。
+
+### 19.4 性能与显存的克制结论
+
+本机同一 prompt 单次 NVTX wall time：DiT 稳态从 1.1607 s/step 降至 1.0013 s/step（-13.73%）；首步含初始化从 178.617 s 降至 174.752 s。Qwen prefill 从 113.043 s 变为 116.319 s（+2.90%）。总 CUPTI 驱动时间约 393–395 s，基本相当。这些不是跨硬件性能承诺。
+
+Qwen model size 从 15,686,911,147 B 降至 14,945,392,032 B（-4.73%）；DiT MXFP8 从 INT8 的 20,967,535,680 B 增至 21,557,467,480 B（+2.81%）。最终进程 torch max allocated 为 633,100,556 B，max reserved 为 939,524,096 B；与原运行相比分别 -6.22% 和 +3.70%，不能宣称所有显存指标都降低。整卡 NVML 含另一服务，已单独标记，未混作单进程数据。
+
+### 19.5 使用边界与复现入口
+
+当前保证范围是本机 B200 的 dense Linear，不包括 MoE、通用跨平台 backend、训练量化或 vLLM 模型目录直接加载。compressed-tensors 先离线转换为 Comfy 单文件；缺失 backend 会明确报错，不静默回退普通 GEMM。MXFP4 activation 量化以 BF16 执行，输出 BF16；Qwen attention 保持 FP32；DiT FlashAttention、视频 VAE Sage INT8 attention 和音频 VAE FP32 保持原路径。
+
+- 运行服务：`http://0.0.0.0:8190`，物理 GPU 1，使用独立 `.venv-mxfp`。原 8188 保留，临时 8191 profiling 已停止。
+- 详细命令、错误、根因和输出：`run_book.md` 第 56–57 节；量化纠错：`run_book_quant.md` 第 4.13–4.15 节。
+- 模型审计：`validate_h3_te_mxfp4.py --audit-only`；七种形状：`--m 388 --all-shapes`。
+- 最终 CUPTI 分析：`logs/mxfp_cupti/attention_fixed/analysis/`；媒体与同帧对照：`logs/mxfp_runs/`。
+
+完整 C++ CMake 工具链问题未宣称解决；当前采用同版本 `_C.abi3.so` 构建产物、官方 FlashInfer JIT-cache 与 CuTe-DSL。未依赖超时未装完的 `flashinfer-cubin`。
